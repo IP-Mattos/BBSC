@@ -10412,6 +10412,60 @@ void TickBbscBossGoodsCheck() {
     }
 }
 
+// One-time item restore (2026-11-01: a guest lost the Blood Gem Workshop Tool to a co-op pickup
+// that showed the popup but gave nothing). Goods ids in <mod>/give-goods.txt, one per line, are
+// put into the carried items through the game's own add (as the boss goods above) once the player
+// is home and alive. Written into the save file by hand, an item is not in the inventory's index
+// and the game does not see it. The file is renamed to give-goods.done when every id is carried.
+void TickBbscGiveGoodsFile() {
+    static bool done = false;
+    static s64 home_since_ms = 0;
+    if (done) {
+        return;
+    }
+    const u64 global = GetGlobalState();
+    if (GetSessionState() != 0 || !ReadablePointer(global, 0x1593) ||
+        ReadValue<u8>(global, 0x08) != 0 || ReadValue<u8>(global, 0x1592) == 0 ||
+        GetCharacterHp(GetLocalPlayerCharacter()) <= 0) {
+        home_since_ms = 0;
+        return;
+    }
+    const s64 now = SteadyNowMs();
+    if (home_since_ms == 0) {
+        home_since_ms = now;
+    }
+    if (now - home_since_ms < 5'000) {
+        return;
+    }
+    done = true;
+    const auto file =
+        Common::FS::GetUserPath(Common::FS::PathType::CapturesDir).parent_path() / "give-goods.txt";
+    std::vector<u32> ids;
+    {
+        std::ifstream in{file};
+        u32 id = 0;
+        while (in >> id) {
+            ids.push_back(id);
+        }
+    }
+    if (ids.empty()) {
+        return;
+    }
+    const u64 carried = BbscCarriedInventory();
+    bool all = carried != 0;
+    for (const u32 id : ids) {
+        const bool had = carried != 0 && BbscInventoryHas(carried, 0x40000000u | id);
+        const bool given = had || GiveBbscBossGoods({0, id, 1, 0});
+        all = all && given;
+        LOG_INFO(Debug, "BBSC give-goods.txt: goods {} - {}", id,
+                 had ? "already carried" : given ? "put into the carried items" : "NOT given");
+    }
+    if (all) {
+        std::error_code ignored;
+        std::filesystem::rename(file, file.parent_path() / "give-goods.done", ignored);
+    }
+}
+
 // Game tick: award the queued boss lots, once each.
 void TickBbscBossRewards() {
     std::vector<s64> due;
@@ -16044,6 +16098,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         TickBbscCoopCountFix();
         TickBbscGuestTypeWatch();
         TickBbscBossGoodsCheck();
+        TickBbscGiveGoodsFile();
         TickBbscRespawnPointWatch();
         TickBbscHostTime();
         TickBbscHomeSpot();
