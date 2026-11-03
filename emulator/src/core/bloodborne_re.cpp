@@ -11453,12 +11453,13 @@ void TickBbscDreamTools(bool restore) {
             continue;
         }
         const bool host_has = !restore && BbscEventFlag(check.host_flag);
-        // 2026-11-02: a guest holding the tool got "the workshop tool is missing" at a host's altar
-        // whose host had none. The guest's own tool opens it too.
+        // 2026-11-02: a guest who owns the tool at home got "the workshop tool is missing" at a
+        // host's altar; the player reports key items gone while in the host's world. In the host's
+        // Dream the checks are open to the guest whoever holds the tool; found records who does.
         const u64 carried = restore ? 0 : BbscCarriedInventory();
         const bool guest_has =
             carried != 0 && BbscInventoryHas(carried, 0x40000000u | check.item);
-        const u8 want = host_has || guest_has ? BbscToolCompareAtMost : BbscToolCompareEqual;
+        const u8 want = restore ? BbscToolCompareEqual : BbscToolCompareAtMost;
         if (ReadValue<u8>(site, 0) != want) {
             WriteValue<u8>(site, 0, want);
         }
@@ -11474,9 +11475,9 @@ void TickBbscDreamTools(bool restore) {
             logged[i] = found[i];
             LOG_INFO(Debug, "BBSC Dream: {} - {}", BbscDreamToolChecks[i].what,
                      found[i] == 0   ? "check not found in memory"
-                     : found[i] == 2 ? "host has the tool, guest may use it"
-                     : found[i] == 3 ? "guest has the tool, guest may use it"
-                                     : "neither the host nor the guest has the tool");
+                     : found[i] == 2 ? "open to the guest (the host has the tool)"
+                     : found[i] == 3 ? "open to the guest (the guest has the tool)"
+                                     : "open to the guest (neither is seen holding the tool)");
         }
     }
 }
