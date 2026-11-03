@@ -25,6 +25,7 @@
 #include <deque>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -57,6 +58,12 @@ constexpr u8 ScaleType = 0x24;  // "SHAD" 0x24 + 5 x u16 the host's scaling perc
 constexpr u8 PvpType = 0x25;    // "SHAD" 0x25 + u8 kind (0 host state, 1 guest asks) + u8 on + u32
 constexpr u8 ProgressType = 0x26; // "SHAD" 0x26 + u8 count + count x u32 the host's boss flags
 constexpr u8 HostBossType = 0x27; // "SHAD" 0x27 + s32 the boss on the host's boss bar (-1 none)
+// "SHAD" 0x28 + u8 protocol level: "this is the BBSC I run" (S7). A build that does not know the type
+// skips it (Dispatch has no else branch), and the server only forwards frames, so a stock 0.0.2
+// player and the server are not affected. Raise BbscProtocolLevel whenever the BBSC packets change
+// in a way an older build cannot read.
+constexpr u8 VersionType = 0x28;
+constexpr u8 BbscProtocolLevel = 1;
 constexpr u8 PeersType = 0x7F; // server -> client: "N other players are connected", 1 byte count
 // Every frame since 2026-10-06: "SHAD" 0x40 + u32 sender + u32 session (the host's sender id, 0 = in
 // no session) + the packet above. The server sends each frame to everyone connected to it, so the
@@ -99,6 +106,14 @@ std::atomic<int> peers{0};
 std::atomic<bool> started{false};
 u32 own_id = 0; // set once in StartRelay, never 0
 std::atomic<bool> logged_old_sender{false};
+// What each sender on this server told us (VersionType): its protocol level, and whether we have
+// already warned about it. A sender that never sent one is not in the map. Under peer_mutex.
+struct PeerVersion {
+    u8 level = 0;
+    bool warned = false;
+};
+std::mutex peer_mutex;
+std::map<u32, PeerVersion> peer_versions;
 
 void Log(const std::string& text) {
     BbscMod::LogPlain(("Relay: " + text).c_str());
@@ -208,6 +223,15 @@ u32 SendFrame(const void* data, u32 size) {
     return static_cast<u32>(peers.load());
 }
 
+// Tells the others which BBSC this is. Asked for when we connect, when another player joins the
+// server, before a host rings a sign, and once in answer to a sender we had not heard from.
+void SendHello() {
+    u8 packet[5] = {'S', 'H', 'A', 'D', VersionType};
+    std::vector<u8> bytes(packet, packet + 5);
+    bytes.push_back(BbscProtocolLevel);
+    SendFrame(bytes.data(), static_cast<u32>(bytes.size()));
+}
+
 std::string SocketError(const char* what) {
     return std::string(what) + " (WSA error " + std::to_string(WSAGetLastError()) + ")";
 }
@@ -256,7 +280,10 @@ DWORD WINAPI WriterThread(void*) {
 
 void Dispatch(const std::vector<u8>& wrapped) {
     if (wrapped.size() == 2 && wrapped[0] == PeersType) {
-        peers = wrapped[1];
+        const int before = peers.exchange(wrapped[1]);
+        if (wrapped[1] > before) {
+            SendHello(); // someone new on the server: let them know our version
+        }
         return;
     }
     if (wrapped.size() < 5 || std::memcmp(wrapped.data(), "SHAD", 4) != 0) {
@@ -331,6 +358,19 @@ void Dispatch(const std::vector<u8>& wrapped) {
             std::int32_t boss = -1;
             std::memcpy(&boss, frame.data() + 5, 4);
             Core::Bloodborne::OnBbscHostBossPacket(boss);
+        }
+    } else if (frame[4] == VersionType && frame.size() >= 6) {
+        bool first = false;
+        {
+            std::scoped_lock lock{peer_mutex};
+            PeerVersion& known = peer_versions[sender];
+            first = known.level == 0;
+            known.level = frame[5];
+        }
+        if (first) {
+            Log("player " + std::to_string(sender) + " runs BBSC protocol level " +
+                std::to_string(frame[5]) + " (ours " + std::to_string(BbscProtocolLevel) + ")");
+            SendHello(); // it may have joined after our hello; once, since it now has an entry
         }
     } else if (frame[4] == PlacementType) {
         // A host looking for signs: for players not in a session yet, any host on the server.
@@ -413,6 +453,7 @@ DWORD WINAPI RelayThread(void*) {
         }
         last_problem.clear();
         Log("connected to " + host + ":" + std::to_string(port));
+        SendHello();
         const u64 connected_at = GetTickCount64();
         u64 frames_in = 0;
         std::string reason;
@@ -488,7 +529,24 @@ void RelayDispatch(const std::vector<u8>& wrapped) {
     Dispatch(wrapped);
 }
 
+// True once per sender when it is not running our protocol level, or never said which BBSC it runs
+// (a stock 0.0.2 or older build). Only called for a host that rang our sign, after its hello (sent
+// first, on the same ordered link) has had its chance to arrive. level_out: 0 = no hello.
+bool RelayPeerIsDifferentVersion(u32 sender, int* level_out) {
+    std::scoped_lock lock{peer_mutex};
+    PeerVersion& known = peer_versions[sender];
+    if (level_out != nullptr) {
+        *level_out = known.level;
+    }
+    if (known.level == BbscProtocolLevel || known.warned) {
+        return false;
+    }
+    known.warned = true;
+    return true;
+}
+
 void RelaySendAimedPlacement(s64 target_user, const std::string& placement) {
+    SendHello(); // ahead of the ring, so the guest knows our version when it reads it
     std::string frame = "SHAD";
     frame.push_back(static_cast<char>(AimedPlacementType));
     frame += std::to_string(target_user) + "|" + placement;

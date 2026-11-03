@@ -13368,12 +13368,12 @@ void TickBbscNoticeRestore(); // below
 // A notice other threads ask for (BbscPostNotice): the banner is a game call, so the game thread
 // shows it from here. 0 = none; 1 = "a host rang our sign but the join failed".
 std::atomic<int> bbsc_notice_request{0};
-s64 bbsc_notice_last_ms[2] = {0, 0};
+s64 bbsc_notice_last_ms[3] = {0, 0, 0};
 constexpr s64 BbscNoticeMinGapMs = 30'000; // a retry every ~55 s must not turn into spam
 
 void TickBbscRequestedNotice() {
     const int request = bbsc_notice_request.exchange(0);
-    if (request != 1) {
+    if (request != 1 && request != 2) {
         return;
     }
     const s64 now = SteadyNowMs();
@@ -13381,6 +13381,13 @@ void TickBbscRequestedNotice() {
         return;
     }
     bbsc_notice_last_ms[request] = now;
+    if (request == 2) {
+        BbscAnnounce(u"The host's BBSC may be a different version.
+If joining fails, you both need the "
+                     u"same BBSC.",
+                     "different version");
+        return;
+    }
     BbscAnnounce(u"A host rang your sign but the join failed.
 They can ring it again.",
                  "join failed");
@@ -17422,7 +17429,7 @@ void BbscTimelineEvent(std::string_view kind, std::string_view text) {
 }
 
 void BbscPostNotice(int which) {
-    if (which == 1) {
+    if (which == 1 || which == 2) {
         bbsc_notice_request.store(which);
     }
 }

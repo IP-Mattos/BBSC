@@ -63,6 +63,7 @@
 namespace BbscMod {
 void RelaySendAimedPlacement(s64 target_user, const std::string& placement);
 u64 EbootAddress(); // bbsc_mod.cpp: where the game image is (0 until found)
+bool RelayPeerIsDifferentVersion(u32 sender, int* level_out); // bbsc_relay.cpp
 bool ReadSlotSafely(u64 address, u64* value);  // bbsc_mod.cpp: no fault if unreadable
 bool WriteSlotSafely(u64 address, u64 value);
 void GuardSlot(u64 slot_offset, u64 wrapper, void** original, const char* name); // bbsc_mod.cpp
@@ -743,6 +744,14 @@ void OnAimedHostPlacement(s64 target_user, const std::string& placement, u32 sen
                  placement);
         BBSC_TIMELINE("JOIN", "HTTP: host {:08x} rang our sign (user {}) - placement {}", sender, own,
                  placement);
+        int level = 0;
+        if (RelayPeerIsDifferentVersion(sender, &level)) {
+            const char* what = level == 0 ? "never said which BBSC it runs (an older or stock build)"
+                                          : "runs a different BBSC protocol level";
+            LOG_WARNING(Mod, "HTTP: host {:08x} {} - joining may fail", sender, what);
+            BBSC_TIMELINE("JOIN", "HTTP: host {:08x} {} - joining may fail", sender, what);
+            Core::Bloodborne::BbscPostNotice(2);
+        }
     }
 }
 

@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-11-03 (c) - tell a guest when the host that rang runs another BBSC
+
+- Request: "Debería decir 'tu amigo tiene otra versión' apenas se cruzan." BBSC_VERSION is "0.0.2" on
+  stock and forked builds, so it cannot tell them apart; what breaks matching is the packet protocol.
+- New relay frame "SHAD" 0x28 + u8 protocol level (BbscProtocolLevel = 1, bbsc_relay.cpp). Sent on
+  connecting, when the server reports another player, once in answer to a sender not heard from yet,
+  and by a host right before it rings a sign. The server only forwards frames and Dispatch has no else
+  branch, so stock 0.0.2 players and the server skip it. Nothing depends on it arriving.
+- When a host rings our sign (OnAimedHostPlacement) and it never sent a hello (older/stock build) or sent
+  another level, once per host: the co-op banner "The host's BBSC may be a different version." and
+  "HTTP: host X never said which BBSC it runs ... joining may fail" in the log and timeline.
+- Cannot detect: a stock host that is compatible (it shows the same hint, worded "may"); a stock guest
+  from the host's side (the guest reaches the host over HTTP, not the relay); servers that drop unknown
+  frame types (every peer then looks old); same level with different code (e.g. the BBport probe).
+  Raise BbscProtocolLevel when packets change. Untested in game.
+
 ## 2026-11-03 (b) - an on-screen notice when a host's bell does not become a join
 
 - Report: "Que avise cuando algo falla. Hoy tocas la campana y no pasa nada." Log shape: the guest posts
