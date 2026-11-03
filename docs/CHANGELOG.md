@@ -1,103 +1,30 @@
 # Changelog
 
-## 2026-11-03 (g) - one-file installer for new players
+## 2026-11-03 - fork changes for BBport 1.9.7
 
-- New bbport/INSTALAR-BBSC.cmd: downloads BBport 1.9.7 and the BBSC kit into a BBSC-Coop folder next to itself, checks each
-  sha256, applies the co-op probe (stock bin kept as bin-original), installs the current bbsc.dll, asks for eboot.bin,
-  runs account creation and makes a desktop shortcut. Run again, it only updates the mod. No game files.
-- It also records the replaced bin files in BBport's bbport-files.json, so BBport stops warning at every start that the
-  files are of different versions. A BBport that is no longer 1.9.7 is left alone, with a warning.
-- Tested end to end with the test flag (download, unpack, probe and DLL hashes, paths file, second run). The account step,
-  file dialog, shortcut and starting the game from a fresh install are UNTESTED.
+Tested in game with two players:
+- Guest with an oath rune can be found. Role 21-23 at sign data +0x76 is posted as 7 in SummonPost.Build (0x01E90E30);
+  a host's search only asks for role 7. Seen with roles 21 and 23: white phantom (chr_type 1), enemies attack, cannot
+  hurt the host. Role 22 not seen.
+- Guest can use the altar and workbench in the host's Dream.
 
-## 2026-11-03 (f) - a guest with an oath rune can be found again
 
-- Confirmed (test3 logs, both players): guest with the Hunter rune "sign posted with role 23 (wire type 5, selection
-  mask 0x800000)", without it role 7 (wire type 0, mask 0x80); the host's only line is "search asks for role 7". The
-  host found the role 7 sign and never the role 23 one.
-- Changed: SummonPost.Build (0x01E90E30) rewrites a role 21-23 byte at sign data +0x76 to 7 before the builder reads
-  it, logged as "BBSC sign roles: oath sign role N posted as role 7". Role 23 was observed; 21 and 22 share its wire
-  type and search bit but were not observed.
-- TESTED 2026-11-03 18:08 (test4, Hunter rune): the guest joined with JoinSession_White, chr_type=1; enemies attack the guest and the guest cannot hurt the host (user). Other oath runes not tested.
+Not tested in game:
+- Boss rewards awarded by a follow-up event reach the guest: Logarius (12501800, Crown of Illusions, lot 2502000) and
+  m35 (13501800, Celestial Dial, lot 3501800). The other template events are already in the table.
+- Key items taken as a guest are put back at home. Goods from the give 0x017D89F0 window 0x016D8850 are listed in
+  item-ledger/owed-<user>-<slot>.txt: keys 4000-4021 except 4014 and 4017, tools 4102-4105, badges 4110-4120, ribbons
+  4903-4908, chalices 6100-6539. Off with SHADPS4_BBSC_ITEM_LEDGER=0. List idea from mark3317/BBSC-GL.
+- Banner when a host rang the sign but the join failed.
+- Banner when the host may run another BBSC. Relay frame "SHAD" 0x28 + u8 BbscProtocolLevel; raise the level when
+  packets change. Stock players ignore the frame, so a compatible stock host also shows the banner.
+- Workshop checks are found in one memory walk (FindAnyInMemory), retried every 20 s up to 4 times per Dream visit.
 
-## 2026-11-03 (e) - role logging for the oath-rune guest that no host rings
+Installer: bbport/INSTALAR-BBSC.cmd downloads BBport 1.9.7 and this kit, checks each sha256, and updates
+bbport-files.json so BBport stops warning about the replaced bin files. Test mode only so far; the account step, file
+dialog, shortcut and first start on a new PC are not tested.
 
-- Request: "pero no deberia pasar" (a guest with an oath rune equipped is never rung by the host's search; it
-  joins within ~10 s of taking the rune off; three tests, same password and server).
-- Found (capture p10124, read-only): the guest's own sign is read back with role byte 23 while the rune is on and
-  role 7 afterwards (SummonCandidate.ManagerScan, candidate +0x08; the role changes at the scan right after the
-  rune comes off). SosStatus event_bits stay 32 in both states, so the status the game computes does not change.
-- Found (eboot disassembly, 0x01872360): a search asks the broker only for roles 7, 8, 18, 21-23 and 24-25, each
-  gated by one SosStatus event bit (7: bit 1, 8: bit 4, 18: bit 8, 21-23: bit 0x10, 24-25: bit 0x40). A host
-  without the bit never asks for role 23, which would explain the missing ring. Not yet confirmed: the host's own
-  log, the routine that turns the oath into role 23 (Lua-driven, not found), and whether the broker filters on it.
-- No fix shipped: forcing the role without knowing where it is set could make the guest join as an adversary (the
-  2026-09-16 covenant finding), so only logging was added. New trace site SummonPost.Build (0x01E90E30, the sign
-  body builder; role byte at sign data +0x76) and the log line "BBSC sign roles: <sign posted with | search asks for
-  | sign list holds> role N (wire type, selection mask, role flags) (caller 0x..)", once per new role/caller, 48 at
-  most, also in the timeline as SIGN. The first line also lists the role table rows 7, 8, 18, 21-25.
-- Next test (guest AND host on this DLL): guest with the Hunter rune on, host searches; then rune off. Read the
-  guest's "sign posted with" / "sign list holds" lines and the host's "search asks for" lines.
-
-## 2026-11-03 (d) - the Dream's workshop checks are found in one memory walk
-
-- Request: "Altar y mesa mas rapidos." The guest's three workshop checks (Memory Altar, workbench gems,
-  Arcane Haze) took 80-90 s from entering the host's Dream: StartBbscToolScan walked all memory once per
-  check.
-- New Core::Bbsc::FindAnyInMemory (bbsc_memscan.cpp): all needles in one walk. The checks share their
-  first bytes (6F 43 82), which an SSE2 anchor tests 16 positions at a time. FindInMemory is unchanged,
-  so the param table scans and the duel bell scan run exactly as before. Same range, same 8-hit cap per
-  check, same site order; every site is still re-validated with BbscToolSiteIntact before a write.
-- Checks still missing after the scan are looked for again, only those, every 20 s, up to 4 times per
-  Dream visit (the talk scripts can load late: a log found the altar but not the workbench). Their
-  sites are added to the ones found; a retry that ends after the guest left is dropped.
-- Log: "BBSC Dream: workshop tool scan took N ms (S site(s) for C check(s))". Untested in game; the
-  speed-up is not measured.
-
-## 2026-11-03 (c) - tell a guest when the host that rang runs another BBSC
-
-- Request: "Debería decir 'tu amigo tiene otra versión' apenas se cruzan." BBSC_VERSION is "0.0.2" on
-  stock and forked builds, so it cannot tell them apart; what breaks matching is the packet protocol.
-- New relay frame "SHAD" 0x28 + u8 protocol level (BbscProtocolLevel = 1, bbsc_relay.cpp). Sent on
-  connecting, when the server reports another player, once in answer to a sender not heard from yet,
-  and by a host right before it rings a sign. The server only forwards frames and Dispatch has no else
-  branch, so stock 0.0.2 players and the server skip it. Nothing depends on it arriving.
-- When a host rings our sign (OnAimedHostPlacement) and it never sent a hello (older/stock build) or sent
-  another level, once per host: the co-op banner "The host's BBSC may be a different version." and
-  "HTTP: host X never said which BBSC it runs ... joining may fail" in the log and timeline.
-- Cannot detect: a stock host that is compatible (it shows the same hint, worded "may"); a stock guest
-  from the host's side (the guest reaches the host over HTTP, not the relay); servers that drop unknown
-  frame types (every peer then looks old); same level with different code (e.g. the BBport probe).
-  Raise BbscProtocolLevel when packets change. Untested in game.
-
-## 2026-11-03 (b) - an on-screen notice when a host's bell does not become a join
-
-- Report: "Que avise cuando algo falla. Hoy tocas la campana y no pasa nada." Log shape: the guest posts
-  its sign, "host X rang our sign", then "a host's claim was delivered N s ago and never became a join".
-- That last event (bbsc_http.cpp, WatchSessionForStaleClaims) now also asks for the co-op banner (the
-  existing BbscAnnounce path) with "A host rang your sign but the join failed. They can ring it again."
-  The request is a flag the game thread shows (TickBbscRejoinLines), at most once per 30 s, and the event
-  itself fires once per delivered claim (about every 55 s on retries). Log: "BBSC notice shown: join failed".
-- Untested in game.
-
-## 2026-11-03 - key items taken as a guest are put back at home
-
-- Report: "Que no se pierdan objetos clave. Juntas uno como invitado y, al volver a casa, desaparece.
-  Ademas queda marcado como tomado, asi que no lo podes juntar de nuevo." The taken mark is the
-  guest-items file (kept as is); this adds the missing half, getting the item back.
-- Idea and key-item list adapted from BBSC-GL (mark3317/BBSC-GL, docs/fixes/K2-items.md and "The item
-  ledger"). Their finding, not yet confirmed in this build: the game's give 0x017D89F0 queues its item
-  window 0x016D8850 only after the add, and the trip home restores the guest's own-world snapshot.
-- New: a hook on 0x016D8850. A window from the give (return 0x017D934D / 0x017D94CC) for a key goods item
-  (keys 4000-4021 but 4014 / 4017, workshop tools 4102-4105, hunter badges 4110-4120, messenger ribbons
-  4903-4908, chalices 6100-6539), while a guest in a host's world, is written to
-  <mod>/item-ledger/owed-<user>-<slot>.txt (one file per character). Never for consumables, gems or
-  weapons; nothing while hosting or solo.
-- At home (alive, 5 s after the load, as give-goods.txt): a listed item the character neither carries nor
-  stores is put in with the game's own add (3 tries, 5 s apart; else it stays listed for the next visit).
-  One already held is only dropped from the list. Logs "BBSC item ledger: ..." and, for a restore,
-  "BBSC CHECK FAIL item-ledger-lost-on-trip" (+ timeline ITEMS).
-- SHADPS4_BBSC_ITEM_LEDGER=0 turns it off. Old guest-items entries are not repaired. Untested in game.
+Logging: "BBSC sign roles" lines show the role posted, held and asked for.
 
 ## 2026-10-04 (c) - mod 11: Silencing Blank ends the co-op cleanly; Memory Altar for the guest
 

@@ -509,8 +509,7 @@ constexpr auto Sites = std::to_array<TraceSite>({
      {0x8B, 0x02, 0x89, 0x85, 0xE8, 0xFE, 0xFF, 0xFF},
      8},
     {"CSRequestGetSos.InsertType", 0x01E5F970, TraceKind::GetSosInsert, StandardR15Prologue, 6},
-    // The function that builds the body of a sign post/request; r9 is the sign data, whose role byte
-    // is at +0x76 (read by the role table lookup at 0x01E90F18). Logged by LogBbscSignRoles.
+    // Builds the sign post/request body. r9 = sign data, role byte at +0x76 (role table 0x01E90F18).
     {"SummonPost.Build", 0x01E90E30, TraceKind::SummonPostBuild, StandardR15Prologue, 6},
     {"SosStatus.Update", SosStatusUpdateOffset, TraceKind::SosStatus, StandardR15Prologue, 6},
     {"SosStatus.NativeResult",
@@ -10272,11 +10271,12 @@ struct BbscBossReward {
     s32 first_lot;
     s32 repeat_lot;
 };
-constexpr std::array<BbscBossReward, 19> BbscBossRewards{{
+constexpr std::array<BbscBossReward, 21> BbscBossRewards{{
     {12101800, 6642, 15000, 15005},       // m21_00
     {12201800, 0, 21002950, 0},           // m22_00 (added 2026-10-20)
     {12301800, 0, 80000000, 0},           // m23_00
     {12301700, 6644, 50800000, 50800005}, // m23_00
+    {12501800, 52502000, 2502000, 0},     // m25_00 (Logarius: Crown of Illusions, awarded by 12501803)
     {12401800, 0, 50000001, 0},           // m24_00
     {12411700, 6645, 50000010, 0},        // m24_01 (Cleric Beast: Saw Hunter Badge)
     {12411800, 0, 31000, 0},              // m24_01
@@ -10290,6 +10290,7 @@ constexpr std::array<BbscBossReward, 19> BbscBossRewards{{
     {13301800, 0, 80000200, 0},           // m33_00
     {13401800, 6674, 3401800, 3401802},   // m34_00
     {13401850, 6673, 3401850, 3401852},   // m34_00
+    {13501800, 53501800, 3501800, 0},     // m35_00 (Celestial Dial, awarded by 13501803)
     {13501850, 0, 3501850, 0},            // m35_00
     {13601800, 0, 3601800, 0},            // m36_00
 }};
@@ -10331,13 +10332,14 @@ struct BbscBossGoodsLot {
     s32 count;
     u32 flag;
 };
-constexpr std::array<BbscBossGoodsLot, 19> BbscBossGoodsLots{{
+constexpr std::array<BbscBossGoodsLot, 20> BbscBossGoodsLots{{
     {15000, 4113, 1, 0},           {15005, 1400, 1, 0},     {80000000, 6109, 1, 5000},
     {50800000, 4118, 1, 0},        {50800005, 1400, 1, 0},  {50000001, 4001, 1, 0},
     {50000010, 4114, 1, 0},        {31000, 4000, 1, 0},     {80000300, 6539, 1, 5009},
     {25700005, 1500, 1, 0},        {55100000, 4323, 1, 50000305}, {2700995, 1500, 1, 52700955},
     {50700000, 7131, 3, 0},        {51001900, 1591, 1, 0},  {80000200, 6429, 1, 5006},
     {3401802, 1500, 1, 0},         {3401852, 1500, 1, 0},   {3501850, 4020, 1, 53501850},
+    {3501800, 4021, 1, 53501800},
     {21002950, 7150, 4, 0}, // m22_00 boss (2026-10-20)
 }};
 u64 BbscCarriedInventory();                   // see "Kit"
@@ -10416,11 +10418,8 @@ void TickBbscBossGoodsCheck() {
     }
 }
 
-// One-time item restore (2026-11-01: a guest lost the Blood Gem Workshop Tool to a co-op pickup
-// that showed the popup but gave nothing). Goods ids in <mod>/give-goods.txt, one per line, are
-// put into the carried items through the game's own add (as the boss goods above) once the player
-// is home and alive. Written into the save file by hand, an item is not in the inventory's index
-// and the game does not see it. The file is renamed to give-goods.done when every id is carried.
+// <mod>/give-goods.txt: goods ids, one per line, added through the game's own add at home, alive.
+// Written into the save by hand, an item is not in the inventory's index and the game misses it.
 void TickBbscGiveGoodsFile() {
     static bool done = false;
     static s64 home_since_ms = 0;
@@ -10444,8 +10443,8 @@ void TickBbscGiveGoodsFile() {
     done = true;
     const auto file =
         Common::FS::GetUserPath(Common::FS::PathType::CapturesDir).parent_path() / "give-goods.txt";
-    // Lots in <mod>/give-lots.txt, one per line, go through the game's own award: a weapon has more
-    // than a goods entry (durability, gem slots), so it cannot be added as goods are.
+    // <mod>/give-lots.txt: lot ids, one per line, for the game's award. A weapon has durability and
+    // gem slots, so it cannot be added as goods.
     const auto lots_file = file.parent_path() / "give-lots.txt";
     std::vector<s32> lots;
     {
@@ -10469,7 +10468,7 @@ void TickBbscGiveGoodsFile() {
             LOG_WARNING(Debug, "BBSC give-lots.txt: item manager not ready - nothing awarded");
         }
     }
-    // Stackable goods in <mod>/give-stack.txt, pairs of id and count: added on top of what is held.
+    // <mod>/give-stack.txt: pairs of id and count, added on top of what is held.
     const auto stack_file = file.parent_path() / "give-stack.txt";
     std::vector<std::pair<u32, s32>> stacks;
     {
@@ -10519,25 +10518,10 @@ void TickBbscGiveGoodsFile() {
     }
 }
 
-// ---- Key-item ledger (2026-11-03) ----------------------------------------------------------------
-// User: "Que no se pierdan objetos clave. Juntas uno como invitado y, al volver a casa, desaparece.
-// Ademas queda marcado como tomado, asi que no lo podes juntar de nuevo."
-//
-// Idea and key-item list adapted from BBSC-GL (mark3317/BBSC-GL, "The item ledger", same GPL code
-// base; credit to its author). Their analysis: the game's own give 0x017D89F0 adds to the local
-// inventory and only then queues the item window 0x016D8850 (from 0x017D934D / 0x017D94CC), so a
-// window means the item WAS added; the guest's save is a snapshot of the guest's own world while it
-// is away (global+0x1592 == 0), so the item is gone at home, while the taken bit of the guest-items
-// file (above) keeps it "taken" for good. That is their finding; this build has not confirmed it yet.
-//
-// This is the small part of that: when the game's give shows its window for a KEY item (keys, workshop
-// tools, hunter badges, chalices, messenger ribbons - never consumables, gems or weapons) while we are
-// a guest in a host's world, the goods id is noted in <mod>/item-ledger/owed-<user>-<slot>.txt (one
-// file per character, written within a second so a crash keeps it). At home (alive, 5 s after the
-// load, as give-goods.txt) every noted id the character neither carries nor stores is put in through
-// the game's own add (GiveBbscBossGoods); one already held is only dropped from the file. What cannot
-// be given stays in the file for the next visit home. Nothing is noted while hosting or solo.
-// SHADPS4_BBSC_ITEM_LEDGER=0 turns it off. Old guest-items entries are not repaired.
+// ---- Key-item ledger -----------------------------------------------------------------------------
+// Idea and key list adapted from BBSC-GL (mark3317/BBSC-GL, same GPL code base; credit to its author).
+// Per BBSC-GL, unconfirmed here: give 0x017D89F0 adds locally, then queues window 0x016D8850. Away
+// (global+0x1592 == 0) the guest saves its own world, so the item is gone at home but stays "taken".
 constexpr u64 BbscLedgerGiveWindow1 = 0x017D934D; // return addresses inside the give 0x017D89F0
 constexpr u64 BbscLedgerGiveWindow2 = 0x017D94CC;
 constexpr u64 BbscItemWindowQueueOffset = 0x016D8850;
@@ -10550,15 +10534,15 @@ bool BbscItemLedgerEnabled() {
     return enabled;
 }
 
-// Keys, workshop tools, hunter badges, chalices and messenger ribbons (BBSC-GL's IsBbscRetroGoods).
-// Quest items handed to NPCs, Laurence's Skull and the Eye Pendant are left out.
+// Keys, workshop tools, hunter badges, chalices, messenger ribbons (BBSC-GL's IsBbscRetroGoods).
+// Not NPC quest items, Laurence's Skull or the Eye Pendant.
 bool IsBbscLedgerKeyGoods(u32 goods) {
     return (goods >= 4000 && goods <= 4021 && goods != 4014 && goods != 4017) ||
            (goods >= 4102 && goods <= 4105) || (goods >= 4110 && goods <= 4120) ||
            (goods >= 4903 && goods <= 4908) || (goods >= 6100 && goods <= 6539);
 }
 
-// File text: a header line, then one goods id per line. Anything unreadable is skipped.
+// Header line, then one goods id per line.
 std::vector<u32> ParseBbscLedgerText(std::string_view text) {
     std::vector<u32> ids;
     size_t at = 0;
@@ -10576,7 +10560,7 @@ std::vector<u32> ParseBbscLedgerText(std::string_view text) {
         if (header) {
             header = false;
             if (line != "BBSC-ITEM-LEDGER 1") {
-                return ids; // not our file
+                return ids;
             }
             continue;
         }
@@ -10609,7 +10593,7 @@ std::filesystem::path BbscItemLedgerPath(const BbscSaveSlot& slot) {
            "item-ledger" / fmt::format("owed-{}-{}.txt", slot.user, slot.slot);
 }
 
-// Caller holds bbsc_item_ledger_mutex. Never throws (runs in the game tick).
+// Never throws: runs in the game tick.
 void WriteBbscItemLedgerLocked() {
     if (!bbsc_item_ledger_dirty || !bbsc_item_ledger_slot.has_value()) {
         return;
@@ -10645,8 +10629,7 @@ void WriteBbscItemLedgerLocked() {
     }
 }
 
-// Caller holds the mutex. Binds the list to `slot`: the other character's list is written first,
-// then this one's file is read and merged with what was noted before a slot was known.
+// Other character's list is written first; notes from before a slot was known merge into this one.
 void BindBbscItemLedgerLocked(const BbscSaveSlot& slot) {
     if (bbsc_item_ledger_slot.has_value() && bbsc_item_ledger_slot->user == slot.user &&
         bbsc_item_ledger_slot->slot == slot.slot) {
@@ -10680,8 +10663,7 @@ void BindBbscItemLedgerLocked(const BbscSaveSlot& slot) {
              bbsc_item_ledger.size());
 }
 
-// The game's item window 0x016D8850 starts (rdi queue, rsi handle, rdx type, rcx id, r8 count): the
-// give's own windows, for a key goods item, while a guest in a host's world.
+// Item window 0x016D8850: rdi queue, rsi handle, rdx type, rcx id, r8 count.
 void PS4_SYSV_ABI BbscItemLedgerWindowHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
     if (registers == nullptr || !BbscItemLedgerEnabled() || image_base == 0 ||
         !ReadablePointer(registers->rsp, 8)) {
@@ -10711,7 +10693,6 @@ void PS4_SYSV_ABI BbscItemLedgerWindowHook(u64 /*tag*/, const GuestRegisterSnaps
 
 u64 BbscStorageInventory(); // see "Restock"
 
-// Game tick. File work is throttled; the restore runs at home.
 void TickBbscItemLedger() {
     static s64 last_ms = 0;
     static s64 slot_ms = 0;
@@ -10741,7 +10722,7 @@ void TickBbscItemLedger() {
     {
         std::scoped_lock lock{bbsc_item_ledger_mutex};
         want_slot = want_slot || bbsc_item_ledger_dirty;
-        WriteBbscItemLedgerLocked(); // a bound list: noted items reach the disk within a second
+        WriteBbscItemLedgerLocked(); // within a second, so a crash keeps the notes
         want_slot = want_slot && (bbsc_item_ledger_dirty || settled_home);
     }
     if (!want_slot || now - slot_ms < 5'000) {
@@ -11750,14 +11731,13 @@ bool BbscToolSiteIntact(u64 site, u32 item) {
            here == BbscToolCheckBytes(item, BbscToolCompareAtMost);
 }
 
-// Counts the Dream visits; a scan started in an earlier visit never adds its sites to a later one.
+// Dream visit count: a scan from an earlier visit must not add its sites to a later one.
 std::atomic<u32> bbsc_tool_visit{0};
 int bbsc_tool_retries = 0;          // game thread only
 s64 bbsc_tool_next_retry_ms = 0;
 
-// Looks for the checks in `wanted` (bit i = BbscDreamToolChecks[i]). All of them are searched in ONE
-// walk of memory (2026-11-03: three walks took 80-90 s in the logs). `retry` = a later look for the
-// checks the first one missed: their sites are added to the ones already found.
+// `wanted`: bit i = BbscDreamToolChecks[i]. One walk for all of them, three walks took 80-90 s.
+// `retry`: later look for missed checks, sites are added to the ones already found.
 void StartBbscToolScan(u32 wanted, bool retry) {
     if (bbsc_tool_scan_running.exchange(true)) {
         return;
@@ -11816,9 +11796,8 @@ void TickBbscDreamTools(bool restore) {
             continue;
         }
         const bool host_has = !restore && BbscEventFlag(check.host_flag);
-        // 2026-11-02: a guest who owns the tool at home got "the workshop tool is missing" at a
-        // host's altar; the player reports key items gone while in the host's world. In the host's
-        // Dream the checks are open to the guest whoever holds the tool; found records who does.
+        // A guest who owns the tool at home gets "the workshop tool is missing" at a host's altar.
+        // In the host's Dream the checks are open whoever holds the tool; found records who does.
         const u64 carried = restore ? 0 : BbscCarriedInventory();
         const bool guest_has =
             carried != 0 && BbscInventoryHas(carried, 0x40000000u | check.item);
@@ -11833,8 +11812,7 @@ void TickBbscDreamTools(bool restore) {
         logged = {-1, -1, -1};
         return;
     }
-    // The talk scripts can load after the first look (a log had the altar but not the workbench): while
-    // a check is still missing, look again for it every 20 s, up to 4 times per visit.
+    // Talk scripts can load after the first look, so missing checks get up to 4 retries, 20 s apart.
     if (bbsc_tool_scan_done && !bbsc_tool_scan_running) {
         u32 missing = 0;
         for (size_t i = 0; i < found.size(); ++i) {
@@ -13410,11 +13388,11 @@ void ArmBbscRejoinLines(bool guest, u32 target_map, s64 for_ms) {
 // Points the role table at the "caught up" lines while a warp is on, and back afterwards.
 void TickBbscNoticeRestore(); // below
 
-// A notice other threads ask for (BbscPostNotice): the banner is a game call, so the game thread
-// shows it from here. 0 = none; 1 = "a host rang our sign but the join failed".
+// Set by other threads (BbscPostNotice). The banner is a game call, so the game thread shows it.
+// 0 = none; 1 = host rang our sign, join failed.
 std::atomic<int> bbsc_notice_request{0};
 s64 bbsc_notice_last_ms[3] = {0, 0, 0};
-constexpr s64 BbscNoticeMinGapMs = 30'000; // a retry every ~55 s must not turn into spam
+constexpr s64 BbscNoticeMinGapMs = 30'000; // retries come every ~55 s
 
 void TickBbscRequestedNotice() {
     const int request = bbsc_notice_request.exchange(0);
@@ -16464,13 +16442,8 @@ void ApplyBbscBellsAnywhere(const GuestRegisterSnapshot* registers) {
     }
 }
 
-// Why does a host never ring the sign of a guest who has an oath rune equipped? The captures of
-// 2026-11-03 show the guest's own sign with role 23 while the rune is on and role 7 once it is off,
-// and the roles a search asks for (SosStatus.Update -> CSRequestGetSos.InsertType) are a short list
-// that depends on the searcher. These lines name, once per new value, what the next test has to
-// read: the role a sign is posted with and by which caller, the role the sign list holds, and the
-// roles a search asks for, each with its row of the role table (wire type, selection mask, flags).
-// Read-only; at most SignRoleLogLimit lines a run.
+// Sign roles, read-only, once per new value. Search: SosStatus.Update -> CSRequestGetSos.InsertType.
+// Role table row: wire type, selection mask, flags.
 constexpr u64 SummonPostBuildOffset = 0x01E90E30;
 constexpr u64 SummonRoleInsertOffset = 0x01E5F970;
 constexpr u64 SummonManagerScanOffset = 0x014B6F5D;
@@ -16538,10 +16511,8 @@ void LogBbscSignRoles(const TraceSite& site, const GuestRegisterSnapshot& regist
     BBSC_TIMELINE("SIGN", "{} {}{}", what, DescribeSignRole(role), caller);
 }
 
-// A guest wearing an oath rune posts the sign with role 21-23, but a host's search only asks for role
-// 7 (logs of 2026-11-03: role 23 with the Hunter rune, "search asks for role 7" on the host), so no
-// host ever rings it. Post the co-op sign as the plain role 7 instead, the role the same guest gets
-// with the rune off. Runs before the builder reads the byte; every other role is left alone.
+// With an oath rune the sign posts as role 21-23, but a host's search only asks for role 7, so no host
+// rings it. The same guest posts role 7 with the rune off. Runs before the builder reads the byte.
 constexpr s8 PlainCoopSignRole = 7;
 
 void ApplyBbscOathSignAsPlain(const TraceSite& site, const GuestRegisterSnapshot& registers) {
