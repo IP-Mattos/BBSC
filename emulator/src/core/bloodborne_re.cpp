@@ -13423,14 +13423,12 @@ void TickBbscRequestedNotice() {
     }
     bbsc_notice_last_ms[request] = now;
     if (request == 2) {
-        BbscAnnounce(u"The host's BBSC may be a different version.
-If joining fails, you both need the "
+        BbscAnnounce(u"The host's BBSC may be a different version.\nIf joining fails, you both need the "
                      u"same BBSC.",
                      "different version");
         return;
     }
-    BbscAnnounce(u"A host rang your sign but the join failed.
-They can ring it again.",
+    BbscAnnounce(u"A host rang your sign but the join failed.\nThey can ring it again.",
                  "join failed");
 }
 
