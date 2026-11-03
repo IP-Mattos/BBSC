@@ -5,6 +5,8 @@
 - New bbport/INSTALAR-BBSC.cmd: downloads BBport 1.9.7 and the BBSC kit into a BBSC-Coop folder next to itself, checks each
   sha256, applies the co-op probe (stock bin kept as bin-original), installs the current bbsc.dll, asks for eboot.bin,
   runs account creation and makes a desktop shortcut. Run again, it only updates the mod. No game files.
+- It also records the replaced bin files in BBport's bbport-files.json, so BBport stops warning at every start that the
+  files are of different versions. A BBport that is no longer 1.9.7 is left alone, with a warning.
 - Tested end to end with the test flag (download, unpack, probe and DLL hashes, paths file, second run). The account step,
   file dialog, shortcut and starting the game from a fresh install are UNTESTED.
 

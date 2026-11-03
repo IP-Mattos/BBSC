@@ -17,6 +17,7 @@ $KitUrl = "https://github.com/IP-Mattos/BBSC/releases/download/v0.0.2-bbport197-
 $KitSha = "35a2cc7c09a9df5e67e32f451714a4f692dc4bfb133602f175e33823f5a4fd86"
 $DllUrl = "https://github.com/IP-Mattos/BBSC/releases/download/v0.0.2-bbport197-test4/bbsc.dll"
 $DllSha = "e78c18ca9036446a1e0fed75c543d1fd4842df0176cf0414646ed499c61a8f80"
+$PortVersion = "1.9.7"
 $NeededFreeGb = 2
 
 $testRun = [bool]$env:BBSC_INSTALL_TEST
@@ -53,7 +54,7 @@ function Expand-To([string]$zip, [string]$marker, [string]$target) {
 if (Get-Process -Name "bb-probe" -ErrorAction SilentlyContinue) { throw "Cierra el juego primero." }
 New-Item -ItemType Directory -Force $root, $downloads | Out-Null
 $free = (Get-Item -LiteralPath $root).PSDrive.Free
-if ($free -lt $NeededFreeGb * 1GB) { throw "Necesitas al menos $NeededFreeGb GB libres en ese disco." }
+if ($null -ne $free -and $free -lt $NeededFreeGb * 1GB) { throw "Necesitas al menos $NeededFreeGb GB libres en ese disco." }
 Write-Host "Instalando en: $root"
 
 Step "BBport 1.9.7"
@@ -84,8 +85,28 @@ $bin = Join-Path $port "bin"
 $kitFiles = Join-Path $kit "BBSC-197-kit"
 if (-not (Test-Path -LiteralPath (Join-Path $kitFiles "probe-bin\bb-probe.exe"))) { throw "Falta BBSC-197-kit en el paquete de BBSC." }
 $original = Join-Path $port "bin-original"
-if (-not (Test-Path -LiteralPath $original)) { Copy-Item -LiteralPath $bin -Destination $original -Recurse }
-Copy-Item -Path (Join-Path $kitFiles "probe-bin\*") -Destination $bin -Recurse -Force
+if (-not (Test-Path -LiteralPath $original)) {
+    $copy = "$original.tmp"
+    if (Test-Path -LiteralPath $copy) { Remove-Item -LiteralPath $copy -Recurse -Force }
+    Copy-Item -LiteralPath $bin -Destination $copy -Recurse
+    Move-Item -LiteralPath $copy -Destination $original
+}
+# BBport warns at every start when bin\bb-probe.exe differs from its bbport-files.json, so the list
+# gets the hashes of the files replaced here. A BBport updated past 1.9.7 is left alone.
+$manifestFile = Join-Path $port "bbport-files.json"
+$manifest = Get-Content -LiteralPath $manifestFile -Raw -Encoding UTF8 | ConvertFrom-Json
+if ($manifest.version -eq $PortVersion) {
+    $probeBin = Join-Path $kitFiles "probe-bin"
+    Copy-Item -Path (Join-Path $probeBin "*") -Destination $bin -Recurse -Force
+    foreach ($file in Get-ChildItem -LiteralPath $probeBin -Recurse -File) {
+        $name = "bin/" + $file.FullName.Substring($probeBin.Length + 1).Replace("\", "/")
+        $entry = $manifest.files.PSObject.Properties[$name]
+        if ($entry) { $entry.Value = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLower() }
+    }
+    [IO.File]::WriteAllText($manifestFile, ($manifest | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding $false))
+} else {
+    Write-Host "Tu BBport es la version $($manifest.version), no la $PortVersion. No cambio sus archivos; el co-op puede fallar." -ForegroundColor Yellow
+}
 Copy-Item -LiteralPath (Join-Path $kitFiles "bbsc-launch.exe") -Destination (Join-Path $kit "bbsc\bbsc-launch.exe") -Force
 # play-bbport.ps1 prefers emulator\bb-probe.exe, the older build that does not work with BBport 1.9.7.
 $oldProbe = Join-Path $kit "emulator\bb-probe.exe"
@@ -124,6 +145,9 @@ if (-not $testRun) {
         Write-Host "Ya tienes una cuenta guardada."
     } else {
         & (Join-Path $kit "tools\create-account.ps1") -FromPlay
+        if (-not (Test-Path -LiteralPath (Join-Path $kit "tools\account.dat"))) {
+            Write-Host "La cuenta no quedo creada. El juego te la va a pedir la primera vez que lo abras." -ForegroundColor Yellow
+        }
     }
 
     Step "Acceso directo"
