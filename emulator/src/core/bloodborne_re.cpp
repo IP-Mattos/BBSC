@@ -11453,11 +11453,16 @@ void TickBbscDreamTools(bool restore) {
             continue;
         }
         const bool host_has = !restore && BbscEventFlag(check.host_flag);
-        const u8 want = host_has ? BbscToolCompareAtMost : BbscToolCompareEqual;
+        // 2026-11-02: a guest holding the tool got "the workshop tool is missing" at a host's altar
+        // whose host had none. The guest's own tool opens it too.
+        const u64 carried = restore ? 0 : BbscCarriedInventory();
+        const bool guest_has =
+            carried != 0 && BbscInventoryHas(carried, 0x40000000u | check.item);
+        const u8 want = host_has || guest_has ? BbscToolCompareAtMost : BbscToolCompareEqual;
         if (ReadValue<u8>(site, 0) != want) {
             WriteValue<u8>(site, 0, want);
         }
-        found[index] = host_has ? 2 : 1;
+        found[index] = host_has ? 2 : guest_has ? 3 : 1;
     }
     if (restore) {
         bbsc_tool_sites.clear();
@@ -11470,7 +11475,8 @@ void TickBbscDreamTools(bool restore) {
             LOG_INFO(Debug, "BBSC Dream: {} - {}", BbscDreamToolChecks[i].what,
                      found[i] == 0   ? "check not found in memory"
                      : found[i] == 2 ? "host has the tool, guest may use it"
-                                     : "host does not have the tool either");
+                     : found[i] == 3 ? "guest has the tool, guest may use it"
+                                     : "neither the host nor the guest has the tool");
         }
     }
 }
