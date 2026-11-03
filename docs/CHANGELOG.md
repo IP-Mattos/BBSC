@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-11-03 - key items taken as a guest are put back at home
+
+- Report: "Que no se pierdan objetos clave. Juntas uno como invitado y, al volver a casa, desaparece.
+  Ademas queda marcado como tomado, asi que no lo podes juntar de nuevo." The taken mark is the
+  guest-items file (kept as is); this adds the missing half, getting the item back.
+- Idea and key-item list adapted from BBSC-GL (mark3317/BBSC-GL, docs/fixes/K2-items.md and "The item
+  ledger"). Their finding, not yet confirmed in this build: the game's give 0x017D89F0 queues its item
+  window 0x016D8850 only after the add, and the trip home restores the guest's own-world snapshot.
+- New: a hook on 0x016D8850. A window from the give (return 0x017D934D / 0x017D94CC) for a key goods item
+  (keys 4000-4021 but 4014 / 4017, workshop tools 4102-4105, hunter badges 4110-4120, messenger ribbons
+  4903-4908, chalices 6100-6539), while a guest in a host's world, is written to
+  <mod>/item-ledger/owed-<user>-<slot>.txt (one file per character). Never for consumables, gems or
+  weapons; nothing while hosting or solo.
+- At home (alive, 5 s after the load, as give-goods.txt): a listed item the character neither carries nor
+  stores is put in with the game's own add (3 tries, 5 s apart; else it stays listed for the next visit).
+  One already held is only dropped from the list. Logs "BBSC item ledger: ..." and, for a restore,
+  "BBSC CHECK FAIL item-ledger-lost-on-trip" (+ timeline ITEMS).
+- SHADPS4_BBSC_ITEM_LEDGER=0 turns it off. Old guest-items entries are not repaired. Untested in game.
+
 ## 2026-10-04 (c) - mod 11: Silencing Blank ends the co-op cleanly; Memory Altar for the guest
 
 - New tool: tools\gamedata\lua50.py - reads the game's compiled Lua (Lua 5.0 with one extra empty list
