@@ -1,5 +1,16 @@
 # Changelog
 
+## 2026-11-03 (f) - a guest with an oath rune can be found again
+
+- Confirmed (test3 logs, both players): guest with the Hunter rune "sign posted with role 23 (wire type 5, selection
+  mask 0x800000)", without it role 7 (wire type 0, mask 0x80); the host's only line is "search asks for role 7". The
+  host found the role 7 sign and never the role 23 one.
+- Changed: SummonPost.Build (0x01E90E30) rewrites a role 21-23 byte at sign data +0x76 to 7 before the builder reads
+  it, logged as "BBSC sign roles: oath sign role N posted as role 7". Role 23 was observed; 21 and 22 share its wire
+  type and search bit but were not observed.
+- UNTESTED in game. To check: the guest joins as a white phantom (type 1), not as an adversary (the 2026-09-16 covenant
+  finding was about oath runes on the pairing, a separate check this does not touch); enemies attack the guest.
+
 ## 2026-11-03 (e) - role logging for the oath-rune guest that no host rings
 
 - Request: "pero no deberia pasar" (a guest with an oath rune equipped is never rung by the host's search; it

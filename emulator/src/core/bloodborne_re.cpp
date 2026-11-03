@@ -16538,6 +16538,25 @@ void LogBbscSignRoles(const TraceSite& site, const GuestRegisterSnapshot& regist
     BBSC_TIMELINE("SIGN", "{} {}{}", what, DescribeSignRole(role), caller);
 }
 
+// A guest wearing an oath rune posts the sign with role 21-23, but a host's search only asks for role
+// 7 (logs of 2026-11-03: role 23 with the Hunter rune, "search asks for role 7" on the host), so no
+// host ever rings it. Post the co-op sign as the plain role 7 instead, the role the same guest gets
+// with the rune off. Runs before the builder reads the byte; every other role is left alone.
+constexpr s8 PlainCoopSignRole = 7;
+
+void ApplyBbscOathSignAsPlain(const TraceSite& site, const GuestRegisterSnapshot& registers) {
+    if (site.offset != SummonPostBuildOffset || !ReadablePointer(registers.r9, 0x77)) {
+        return;
+    }
+    const s8 role = ReadValue<s8>(registers.r9, 0x76);
+    if (role < 21 || role > 23) {
+        return;
+    }
+    WriteValue<s8>(registers.r9, 0x76, PlainCoopSignRole);
+    LOG_INFO(Debug, "BBSC sign roles: oath sign role {} posted as role {}",
+             static_cast<s32>(role), static_cast<s32>(PlainCoopSignRole));
+}
+
 void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
     if (tag >= Sites.size() || registers == nullptr) {
         return;
@@ -16545,6 +16564,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
 
     const auto& site = Sites[tag];
     LogBbscSignRoles(site, *registers);
+    ApplyBbscOathSignAsPlain(site, *registers);
     if (site.offset == ItemUsableResultOffset) {
         ApplyBbscBellsAnywhere(registers);
     }
