@@ -16552,9 +16552,10 @@ void ApplyBbscOathSignAsPlain(const TraceSite& site, const GuestRegisterSnapshot
     if (role < 21 || role > 23) {
         return;
     }
-    WriteValue<s8>(registers.r9, 0x76, PlainCoopSignRole);
-    LOG_INFO(Debug, "BBSC sign roles: oath sign role {} posted as role {}",
-             static_cast<s32>(role), static_cast<s32>(PlainCoopSignRole));
+    const bool written = WriteValue<s8>(registers.r9, 0x76, PlainCoopSignRole);
+    LOG_INFO(Debug, "BBSC sign roles: oath sign role {} posted as role {}: {}",
+             static_cast<s32>(role), static_cast<s32>(PlainCoopSignRole),
+             written ? "written" : "write failed");
 }
 
 void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
