@@ -10440,6 +10440,55 @@ void TickBbscGiveGoodsFile() {
     done = true;
     const auto file =
         Common::FS::GetUserPath(Common::FS::PathType::CapturesDir).parent_path() / "give-goods.txt";
+    // Lots in <mod>/give-lots.txt, one per line, go through the game's own award: a weapon has more
+    // than a goods entry (durability, gem slots), so it cannot be added as goods are.
+    const auto lots_file = file.parent_path() / "give-lots.txt";
+    std::vector<s32> lots;
+    {
+        std::ifstream in{lots_file};
+        s32 lot = 0;
+        while (in >> lot) {
+            lots.push_back(lot);
+        }
+    }
+    if (!lots.empty()) {
+        const u64 item_man = ReadValue<u64>(image_base + ItemManPointerOffset, 0);
+        if (ReadablePointer(item_man, 0x10)) {
+            using AwardItemLot = void PS4_SYSV_ABI (*)(u64 item_man, s32 lot, u32 forced);
+            for (const s32 lot : lots) {
+                reinterpret_cast<AwardItemLot>(image_base + AwardItemLotOffset)(item_man, lot, 0);
+                LOG_INFO(Debug, "BBSC give-lots.txt: item lot {} awarded", lot);
+            }
+            std::error_code ignored;
+            std::filesystem::rename(lots_file, lots_file.parent_path() / "give-lots.done", ignored);
+        } else {
+            LOG_WARNING(Debug, "BBSC give-lots.txt: item manager not ready - nothing awarded");
+        }
+    }
+    // Stackable goods in <mod>/give-stack.txt, pairs of id and count: added on top of what is held.
+    const auto stack_file = file.parent_path() / "give-stack.txt";
+    std::vector<std::pair<u32, s32>> stacks;
+    {
+        std::ifstream in{stack_file};
+        u32 id = 0;
+        s32 count = 0;
+        while (in >> id >> count) {
+            stacks.emplace_back(id, count);
+        }
+    }
+    if (!stacks.empty()) {
+        bool every = true;
+        for (const auto& [id, count] : stacks) {
+            const bool given = GiveBbscBossGoods({0, id, count, 0});
+            every = every && given;
+            LOG_INFO(Debug, "BBSC give-stack.txt: goods {} x{} - {}", id, count,
+                     given ? "put into the carried items" : "NOT given");
+        }
+        if (every) {
+            std::error_code ignored;
+            std::filesystem::rename(stack_file, stack_file.parent_path() / "give-stack.done", ignored);
+        }
+    }
     std::vector<u32> ids;
     {
         std::ifstream in{file};
