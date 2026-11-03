@@ -8,7 +8,6 @@ Tested in game with two players:
   hurt the host. Role 22 not seen.
 - Guest can use the altar and workbench in the host's Dream.
 
-
 Not tested in game:
 - Boss rewards awarded by a follow-up event reach the guest: Logarius (12501800, Crown of Illusions, lot 2502000) and
   m35 (13501800, Celestial Dial, lot 3501800). The other template events are already in the table.

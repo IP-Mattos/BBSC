@@ -38,8 +38,7 @@ void SearchRegion(const std::uint8_t* start, std::size_t size, const std::uint8_
     }
 }
 
-// Several needles in one region. `anchor` bytes (2 or 3, shared by every needle) are matched 16
-// positions at a time; each candidate is then compared against every needle. A fault ends the region.
+// `anchor` = 2 or 3 bytes every needle shares, 16 positions at a time. A fault ends the region.
 void SearchRegionMany(const std::uint8_t* start, std::size_t size,
                       std::span<const std::span<const std::uint8_t>> needles, std::size_t anchor,
                       std::vector<std::vector<std::uint64_t>>& hits, std::size_t max_hits_each) {
@@ -86,7 +85,7 @@ void SearchRegionMany(const std::uint8_t* start, std::size_t size,
             }
             at += 16;
         }
-        for (; !full() && at < end; ++at) { // the last few bytes
+        for (; !full() && at < end; ++at) {
             if (*at == needles[0][0]) {
                 check(at, end);
             }
@@ -149,7 +148,7 @@ std::vector<std::pair<std::size_t, std::uint64_t>> FindAnyInMemory(
         anchor = same;
     }
     std::vector<std::vector<std::uint64_t>> hits(needles.size());
-    if (anchor < 2) { // no shared prefix to anchor on: one ordinary walk per needle
+    if (anchor < 2) { // no shared prefix
         for (std::size_t i = 0; i < needles.size(); ++i) {
             hits[i] = FindInMemory(needles[i], lo, hi, max_hits_each);
         }

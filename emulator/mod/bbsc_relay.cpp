@@ -58,10 +58,8 @@ constexpr u8 ScaleType = 0x24;  // "SHAD" 0x24 + 5 x u16 the host's scaling perc
 constexpr u8 PvpType = 0x25;    // "SHAD" 0x25 + u8 kind (0 host state, 1 guest asks) + u8 on + u32
 constexpr u8 ProgressType = 0x26; // "SHAD" 0x26 + u8 count + count x u32 the host's boss flags
 constexpr u8 HostBossType = 0x27; // "SHAD" 0x27 + s32 the boss on the host's boss bar (-1 none)
-// "SHAD" 0x28 + u8 protocol level: "this is the BBSC I run" (S7). A build that does not know the type
-// skips it (Dispatch has no else branch), and the server only forwards frames, so a stock 0.0.2
-// player and the server are not affected. Raise BbscProtocolLevel whenever the BBSC packets change
-// in a way an older build cannot read.
+// "SHAD" 0x28 + u8 protocol level. Dispatch has no else branch, so stock 0.0.2 skips it. Raise
+// BbscProtocolLevel when BBSC packets change in a way an older build cannot read.
 constexpr u8 VersionType = 0x28;
 constexpr u8 BbscProtocolLevel = 1;
 constexpr u8 PeersType = 0x7F; // server -> client: "N other players are connected", 1 byte count
@@ -106,8 +104,7 @@ std::atomic<int> peers{0};
 std::atomic<bool> started{false};
 u32 own_id = 0; // set once in StartRelay, never 0
 std::atomic<bool> logged_old_sender{false};
-// What each sender on this server told us (VersionType): its protocol level, and whether we have
-// already warned about it. A sender that never sent one is not in the map. Under peer_mutex.
+// Per sender, from VersionType. Under peer_mutex.
 struct PeerVersion {
     u8 level = 0;
     bool warned = false;
@@ -223,8 +220,6 @@ u32 SendFrame(const void* data, u32 size) {
     return static_cast<u32>(peers.load());
 }
 
-// Tells the others which BBSC this is. Asked for when we connect, when another player joins the
-// server, before a host rings a sign, and once in answer to a sender we had not heard from.
 void SendHello() {
     u8 packet[5] = {'S', 'H', 'A', 'D', VersionType};
     std::vector<u8> bytes(packet, packet + 5);
@@ -282,7 +277,7 @@ void Dispatch(const std::vector<u8>& wrapped) {
     if (wrapped.size() == 2 && wrapped[0] == PeersType) {
         const int before = peers.exchange(wrapped[1]);
         if (wrapped[1] > before) {
-            SendHello(); // someone new on the server: let them know our version
+            SendHello();
         }
         return;
     }
@@ -370,7 +365,7 @@ void Dispatch(const std::vector<u8>& wrapped) {
         if (first) {
             Log("player " + std::to_string(sender) + " runs BBSC protocol level " +
                 std::to_string(frame[5]) + " (ours " + std::to_string(BbscProtocolLevel) + ")");
-            SendHello(); // it may have joined after our hello; once, since it now has an entry
+            SendHello(); // it may have joined after our hello; once, it now has an entry
         }
     } else if (frame[4] == PlacementType) {
         // A host looking for signs: for players not in a session yet, any host on the server.
@@ -529,9 +524,8 @@ void RelayDispatch(const std::vector<u8>& wrapped) {
     Dispatch(wrapped);
 }
 
-// True once per sender when it is not running our protocol level, or never said which BBSC it runs
-// (a stock 0.0.2 or older build). Only called for a host that rang our sign, after its hello (sent
-// first, on the same ordered link) has had its chance to arrive. level_out: 0 = no hello.
+// True once per sender on another level or with no hello (stock 0.0.2, older builds). level_out: 0 =
+// no hello. Call only for a host that rang our sign: its hello is sent first on the same ordered link.
 bool RelayPeerIsDifferentVersion(u32 sender, int* level_out) {
     std::scoped_lock lock{peer_mutex};
     PeerVersion& known = peer_versions[sender];
@@ -546,7 +540,7 @@ bool RelayPeerIsDifferentVersion(u32 sender, int* level_out) {
 }
 
 void RelaySendAimedPlacement(s64 target_user, const std::string& placement) {
-    SendHello(); // ahead of the ring, so the guest knows our version when it reads it
+    SendHello(); // must precede the ring: the guest checks our version when it reads it
     std::string frame = "SHAD";
     frame.push_back(static_cast<char>(AimedPlacementType));
     frame += std::to_string(target_user) + "|" + placement;

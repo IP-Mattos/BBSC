@@ -1,5 +1,5 @@
 @echo off
-rem Installs BBSC co-op on BBport 1.9.7 next to this file. Downloads BBport and BBSC, no game files.
+rem BBSC co-op on BBport 1.9.7, next to this file. Downloads BBport and BBSC, no game files.
 set "BBSC_SELF=%~f0"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$s = [IO.File]::ReadAllText($env:BBSC_SELF); & ([ScriptBlock]::Create($s.Substring($s.IndexOf('#' + 'PS-START'))))"
 set "BBSC_RESULT=%errorlevel%"
@@ -10,7 +10,7 @@ exit /b %BBSC_RESULT%
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-# Update these for each release; each sha256 comes from the GitHub release asset digest.
+# Bump per release. sha256 = GitHub release asset digest.
 $PortUrl = "https://github.com/Supermedo/bloodborne_pc/releases/download/windows-v1.9.7/Bloodborne-Windows.zip"
 $PortSha = "b3444c6a4d201e75f2b3ea80f2f4663bfa8e78eda7652054819ba8622cc7a759"
 $KitUrl = "https://github.com/IP-Mattos/BBSC/releases/download/v0.0.2-bbport197-test2/BBSC-0.0.2-BBport-1.9.7-coop-test2.zip"
@@ -28,7 +28,6 @@ $downloads = Join-Path $root "_descargas"
 
 function Step([string]$text) { Write-Host ""; Write-Host "== $text" -ForegroundColor Cyan }
 
-# Downloads $url to $file unless a good copy is there; refuses a file whose hash differs.
 function Get-Verified([string]$url, [string]$file, [string]$sha) {
     if ((Test-Path -LiteralPath $file) -and (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -eq $sha) { return }
     & curl.exe -L --fail --retry 3 --progress-bar -o $file $url
@@ -39,7 +38,7 @@ function Get-Verified([string]$url, [string]$file, [string]$sha) {
     }
 }
 
-# Unpacks $zip and moves the folder holding $marker to $target, so a failed run leaves no half folder.
+# Moved to $target last, so a failed run leaves no half folder.
 function Expand-To([string]$zip, [string]$marker, [string]$target) {
     $temp = "$target.tmp"
     if (Test-Path -LiteralPath $temp) { Remove-Item -LiteralPath $temp -Recurse -Force }
@@ -91,8 +90,7 @@ if (-not (Test-Path -LiteralPath $original)) {
     Copy-Item -LiteralPath $bin -Destination $copy -Recurse
     Move-Item -LiteralPath $copy -Destination $original
 }
-# BBport warns at every start when bin\bb-probe.exe differs from its bbport-files.json, so the list
-# gets the hashes of the files replaced here. A BBport updated past 1.9.7 is left alone.
+# BBport warns at every start when bin\bb-probe.exe differs from bbport-files.json.
 $manifestFile = Join-Path $port "bbport-files.json"
 $manifest = Get-Content -LiteralPath $manifestFile -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($manifest.version -eq $PortVersion) {
@@ -108,7 +106,7 @@ if ($manifest.version -eq $PortVersion) {
     Write-Host "Tu BBport es la version $($manifest.version), no la $PortVersion. No cambio sus archivos; el co-op puede fallar." -ForegroundColor Yellow
 }
 Copy-Item -LiteralPath (Join-Path $kitFiles "bbsc-launch.exe") -Destination (Join-Path $kit "bbsc\bbsc-launch.exe") -Force
-# play-bbport.ps1 prefers emulator\bb-probe.exe, the older build that does not work with BBport 1.9.7.
+# play-bbport.ps1 prefers emulator\bb-probe.exe, an older build that fails on BBport 1.9.7.
 $oldProbe = Join-Path $kit "emulator\bb-probe.exe"
 if (Test-Path -LiteralPath $oldProbe) { Move-Item -LiteralPath $oldProbe -Destination "$oldProbe.bak" -Force }
 
