@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-11-03 (d) - the Dream's workshop checks are found in one memory walk
+
+- Request: "Altar y mesa mas rapidos." The guest's three workshop checks (Memory Altar, workbench gems,
+  Arcane Haze) took 80-90 s from entering the host's Dream: StartBbscToolScan walked all memory once per
+  check.
+- New Core::Bbsc::FindAnyInMemory (bbsc_memscan.cpp): all needles in one walk. The checks share their
+  first bytes (6F 43 82), which an SSE2 anchor tests 16 positions at a time. FindInMemory is unchanged,
+  so the param table scans and the duel bell scan run exactly as before. Same range, same 8-hit cap per
+  check, same site order; every site is still re-validated with BbscToolSiteIntact before a write.
+- Checks still missing after the scan are looked for again, only those, every 20 s, up to 4 times per
+  Dream visit (the talk scripts can load late: a log found the altar but not the workbench). Their
+  sites are added to the ones found; a retry that ends after the guest left is dropped.
+- Log: "BBSC Dream: workshop tool scan took N ms (S site(s) for C check(s))". Untested in game; the
+  speed-up is not measured.
+
 ## 2026-11-03 (c) - tell a guest when the host that rang runs another BBSC
 
 - Request: "Debería decir 'tu amigo tiene otra versión' apenas se cruzan." BBSC_VERSION is "0.0.2" on

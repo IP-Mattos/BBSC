@@ -16,7 +16,7 @@ Objective: stop guests permanently losing key items gained in a host's world. Br
 
 - T2 | S6 | delegated (context backstop) | status: built (CI pending), in-game untested | commit: feat(mod): tell the guest when a host's bell did not become a join
 - T3 | S7 | delegated (context backstop) | status: built (CI pending), in-game untested | commit: feat(mod): warn a guest when the host that rang runs another BBSC
-- T4 | S8 | delegated (context backstop) | status: pending | commit: -
+- T4 | S8 | delegated (context backstop) | status: built (CI pending), in-game untested, speed unmeasured | commit: perf(mod): find the Dream's workshop checks in one memory walk
 ## Log
 - L1 (2026-11-03, user, on "Que no se pierdan objetos clave... ¿Querés que la haga en nuestro fork?"): "ok"
 - Engram mirror pending: this session ran from the home directory; project scope unresolved.

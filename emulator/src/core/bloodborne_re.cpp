@@ -11746,24 +11746,47 @@ bool BbscToolSiteIntact(u64 site, u32 item) {
            here == BbscToolCheckBytes(item, BbscToolCompareAtMost);
 }
 
-void StartBbscToolScan() {
+// Counts the Dream visits; a scan started in an earlier visit never adds its sites to a later one.
+std::atomic<u32> bbsc_tool_visit{0};
+int bbsc_tool_retries = 0;          // game thread only
+s64 bbsc_tool_next_retry_ms = 0;
+
+// Looks for the checks in `wanted` (bit i = BbscDreamToolChecks[i]). All of them are searched in ONE
+// walk of memory (2026-11-03: three walks took 80-90 s in the logs). `retry` = a later look for the
+// checks the first one missed: their sites are added to the ones already found.
+void StartBbscToolScan(u32 wanted, bool retry) {
     if (bbsc_tool_scan_running.exchange(true)) {
         return;
     }
     bbsc_tool_scan_done = false;
-    std::thread([] {
-        std::vector<std::pair<size_t, u64>> sites;
+    const u32 visit = bbsc_tool_visit.load();
+    std::thread([wanted, retry, visit] {
+        const s64 began = SteadyNowMs();
+        std::array<std::array<u8, 11>, BbscDreamToolChecks.size()> bytes{};
+        std::vector<std::span<const u8>> needles;
+        std::vector<size_t> index; // needle -> check
         for (size_t i = 0; i < BbscDreamToolChecks.size(); ++i) {
-            const auto needle = BbscToolCheckBytes(BbscDreamToolChecks[i].item, BbscToolCompareEqual);
-            for (const u64 hit :
-                 Core::Bbsc::FindInMemory(needle, BbscScanLow(), 0x10000000000ULL, 8)) {
-                sites.emplace_back(i, hit + 7);
+            if ((wanted & (1u << i)) != 0) {
+                bytes[i] = BbscToolCheckBytes(BbscDreamToolChecks[i].item, BbscToolCompareEqual);
+                needles.emplace_back(bytes[i]);
+                index.push_back(i);
             }
+        }
+        std::vector<std::pair<size_t, u64>> sites;
+        for (const auto& [needle, hit] :
+             Core::Bbsc::FindAnyInMemory(needles, BbscScanLow(), 0x10000000000ULL, 8)) {
+            sites.emplace_back(index[needle], hit + 7);
         }
         {
             std::scoped_lock lock{bbsc_tool_mutex};
-            bbsc_tool_sites = std::move(sites);
+            if (!retry) {
+                bbsc_tool_sites = sites;
+            } else if (visit == bbsc_tool_visit.load()) {
+                bbsc_tool_sites.insert(bbsc_tool_sites.end(), sites.begin(), sites.end());
+            }
         }
+        LOG_INFO(Debug, "BBSC Dream: workshop tool scan{} took {} ms ({} site(s) for {} check(s))",
+                 retry ? " (retry)" : "", SteadyNowMs() - began, sites.size(), needles.size());
         bbsc_tool_scan_done = true;
         bbsc_tool_scan_running = false;
     }).detach();
@@ -11780,6 +11803,9 @@ void TickBbscDreamTools(bool restore) {
     last_ms = now;
     std::scoped_lock lock{bbsc_tool_mutex};
     std::array<int, 3> found{};
+    if (restore) {
+        ++bbsc_tool_visit;
+    }
     for (const auto& [index, site] : bbsc_tool_sites) {
         const BbscToolCheck& check = BbscDreamToolChecks[index];
         if (!BbscToolSiteIntact(site, check.item)) {
@@ -11802,6 +11828,19 @@ void TickBbscDreamTools(bool restore) {
         bbsc_tool_sites.clear();
         logged = {-1, -1, -1};
         return;
+    }
+    // The talk scripts can load after the first look (a log had the altar but not the workbench): while
+    // a check is still missing, look again for it every 20 s, up to 4 times per visit.
+    if (bbsc_tool_scan_done && !bbsc_tool_scan_running) {
+        u32 missing = 0;
+        for (size_t i = 0; i < found.size(); ++i) {
+            missing |= found[i] == 0 ? (1u << i) : 0u;
+        }
+        if (missing != 0 && bbsc_tool_retries < 4 && now >= bbsc_tool_next_retry_ms) {
+            ++bbsc_tool_retries;
+            bbsc_tool_next_retry_ms = now + 20'000;
+            StartBbscToolScan(missing, true);
+        }
     }
     for (size_t i = 0; i < found.size(); ++i) {
         if (bbsc_tool_scan_done && found[i] != logged[i]) {
@@ -11833,7 +11872,9 @@ void TickBbscDream() {
     }
     in_dream = now;
     if (now) {
-        StartBbscToolScan();
+        bbsc_tool_retries = 0;
+        bbsc_tool_next_retry_ms = SteadyNowMs() + 20'000;
+        StartBbscToolScan(0x7, false);
         LOG_INFO(Debug,
                  "BBSC Dream: guest in the host's Hunter's Dream - Doll, Gehrman{}, workshop and "
                  "messengers open to the guest; headstones and Ritual Altars stay the host's",
