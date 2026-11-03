@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-11-03 (g) - one-file installer for new players
+
+- New bbport/INSTALAR-BBSC.cmd: downloads BBport 1.9.7 and the BBSC kit into a BBSC-Coop folder next to itself, checks each
+  sha256, applies the co-op probe (stock bin kept as bin-original), installs the current bbsc.dll, asks for eboot.bin,
+  runs account creation and makes a desktop shortcut. Run again, it only updates the mod. No game files.
+- Tested end to end with the test flag (download, unpack, probe and DLL hashes, paths file, second run). The account step,
+  file dialog, shortcut and starting the game from a fresh install are UNTESTED.
+
 ## 2026-11-03 (f) - a guest with an oath rune can be found again
 
 - Confirmed (test3 logs, both players): guest with the Hunter rune "sign posted with role 23 (wire type 5, selection
