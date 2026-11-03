@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-11-03 (b) - an on-screen notice when a host's bell does not become a join
+
+- Report: "Que avise cuando algo falla. Hoy tocas la campana y no pasa nada." Log shape: the guest posts
+  its sign, "host X rang our sign", then "a host's claim was delivered N s ago and never became a join".
+- That last event (bbsc_http.cpp, WatchSessionForStaleClaims) now also asks for the co-op banner (the
+  existing BbscAnnounce path) with "A host rang your sign but the join failed. They can ring it again."
+  The request is a flag the game thread shows (TickBbscRejoinLines), at most once per 30 s, and the event
+  itself fires once per delivered claim (about every 55 s on retries). Log: "BBSC notice shown: join failed".
+- Untested in game.
+
 ## 2026-11-03 - key items taken as a guest are put back at home
 
 - Report: "Que no se pierdan objetos clave. Juntas uno como invitado y, al volver a casa, desaparece.

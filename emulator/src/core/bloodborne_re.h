@@ -17,6 +17,9 @@ void ClearSeamlessHostPlacementHeader();
 // BBSC timeline: one line in this run's bbsc-timeline-*.txt ("kind" like NET, RELAY, JOIN). Any
 // thread; reads no game memory.
 void BbscTimelineEvent(std::string_view kind, std::string_view text);
+// BBSC on-screen notice asked for from any thread; the game thread shows it (rate limited).
+// 1 = a host rang our sign but the join failed.
+void BbscPostNotice(int which);
 // BBSC connect-first cross-map summon: the host map a pending sign should advertise, if any.
 std::optional<std::uint32_t> GetBbscConnectFirstAreaId();
 // BBSC message / bloodstain lists: lowers every "GetCount" of a .../message_area request body to

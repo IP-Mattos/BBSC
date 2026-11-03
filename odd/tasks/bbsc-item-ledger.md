@@ -14,7 +14,7 @@ Objective: stop guests permanently losing key items gained in a host's world. Br
 ## Tasks
 - T1 | S1-S5 | delegated (context backstop) | status: built (CI pending), in-game untested | commit: see git log (feat(mod): note key items taken as a guest...)
 
-- T2 | S6 | delegated (context backstop) | status: pending | commit: -
+- T2 | S6 | delegated (context backstop) | status: built (CI pending), in-game untested | commit: feat(mod): tell the guest when a host's bell did not become a join
 - T3 | S7 | delegated (context backstop) | status: pending | commit: -
 - T4 | S8 | delegated (context backstop) | status: pending | commit: -
 ## Log

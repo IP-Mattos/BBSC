@@ -420,6 +420,7 @@ void WatchSessionForStaleClaims() {
         BBSC_TIMELINE("JOIN", "HTTP: a host's claim was delivered {} s ago and never became a join - "
                          "the next sign first clears it",
                     (NowMs() - delivered) / 1000);
+        Core::Bloodborne::BbscPostNotice(1); // on-screen, so the host's bell is not silent
     }
 }
 
