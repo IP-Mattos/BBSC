@@ -8,8 +8,7 @@
 - Changed: SummonPost.Build (0x01E90E30) rewrites a role 21-23 byte at sign data +0x76 to 7 before the builder reads
   it, logged as "BBSC sign roles: oath sign role N posted as role 7". Role 23 was observed; 21 and 22 share its wire
   type and search bit but were not observed.
-- UNTESTED in game. To check: the guest joins as a white phantom (type 1), not as an adversary (the 2026-09-16 covenant
-  finding was about oath runes on the pairing, a separate check this does not touch); enemies attack the guest.
+- TESTED 2026-11-03 18:08 (test4, Hunter rune): the guest joined with JoinSession_White, chr_type=1; enemies attack the guest and the guest cannot hurt the host (user). Other oath runes not tested.
 
 ## 2026-11-03 (e) - role logging for the oath-rune guest that no host rings
 
