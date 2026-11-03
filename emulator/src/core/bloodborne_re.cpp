@@ -104,6 +104,7 @@ enum class TraceKind : u8 {
     WorldStateValidation,
     EnginePanic,
     LuaSessionEvent,
+    SummonPostBuild,
 };
 
 struct TraceSite {
@@ -508,6 +509,9 @@ constexpr auto Sites = std::to_array<TraceSite>({
      {0x8B, 0x02, 0x89, 0x85, 0xE8, 0xFE, 0xFF, 0xFF},
      8},
     {"CSRequestGetSos.InsertType", 0x01E5F970, TraceKind::GetSosInsert, StandardR15Prologue, 6},
+    // The function that builds the body of a sign post/request; r9 is the sign data, whose role byte
+    // is at +0x76 (read by the role table lookup at 0x01E90F18). Logged by LogBbscSignRoles.
+    {"SummonPost.Build", 0x01E90E30, TraceKind::SummonPostBuild, StandardR15Prologue, 6},
     {"SosStatus.Update", SosStatusUpdateOffset, TraceKind::SosStatus, StandardR15Prologue, 6},
     {"SosStatus.NativeResult",
      0x0187239E,
@@ -16460,12 +16464,87 @@ void ApplyBbscBellsAnywhere(const GuestRegisterSnapshot* registers) {
     }
 }
 
+// Why does a host never ring the sign of a guest who has an oath rune equipped? The captures of
+// 2026-11-03 show the guest's own sign with role 23 while the rune is on and role 7 once it is off,
+// and the roles a search asks for (SosStatus.Update -> CSRequestGetSos.InsertType) are a short list
+// that depends on the searcher. These lines name, once per new value, what the next test has to
+// read: the role a sign is posted with and by which caller, the role the sign list holds, and the
+// roles a search asks for, each with its row of the role table (wire type, selection mask, flags).
+// Read-only; at most SignRoleLogLimit lines a run.
+constexpr u64 SummonPostBuildOffset = 0x01E90E30;
+constexpr u64 SummonRoleInsertOffset = 0x01E5F970;
+constexpr u64 SummonManagerScanOffset = 0x014B6F5D;
+constexpr size_t SignRoleLogLimit = 48;
+constexpr size_t RoleWireTypeOffset = 0x1C;
+
+std::string DescribeSignRole(s32 role) {
+    if (role < 0 || role >= RoleMetadataCount || image_base == 0) {
+        return fmt::format("role {} (outside the role table)", role);
+    }
+    const u64 row =
+        image_base + RoleMetadataTableOffset + static_cast<u64>(role) * RoleMetadataStride;
+    return fmt::format("role {} (wire type {}, selection mask {:#x}, role flags {:#x})", role,
+                       static_cast<u32>(ReadValue<u8>(row, RoleWireTypeOffset)),
+                       ReadValue<u32>(row, 0x04), static_cast<u32>(ReadValue<u8>(row, 0x08)));
+}
+
+void WriteSummonPostBuild(std::ostream& out, const GuestRegisterSnapshot& registers) {
+    const u64 return_address = ReadValue<u64>(registers.rsp, 0);
+    out << ",\"summon_post\":{\"role_code\":"
+        << static_cast<s32>(ReadValue<s8>(registers.r9, 0x76)) << ",\"caller_offset\":\"0x"
+        << std::hex << (return_address >= image_base ? return_address - image_base : 0)
+        << std::dec << "\"}";
+}
+
+void LogBbscSignRoles(const TraceSite& site, const GuestRegisterSnapshot& registers) {
+    if (site.offset != SummonPostBuildOffset && site.offset != SummonRoleInsertOffset &&
+        site.offset != SummonManagerScanOffset) {
+        return;
+    }
+    s32 role = -1;
+    u64 caller_offset = 0;
+    const char* what = "sign list holds";
+    if (site.offset == SummonPostBuildOffset) {
+        what = "sign posted with";
+        role = static_cast<s32>(ReadValue<s8>(registers.r9, 0x76));
+        const u64 return_address = ReadValue<u64>(registers.rsp, 0);
+        caller_offset = return_address >= image_base ? return_address - image_base : 0;
+    } else if (site.offset == SummonRoleInsertOffset) {
+        what = "search asks for";
+        role = static_cast<s32>(registers.rsi);
+    } else {
+        role = static_cast<s32>(ReadValue<s8>(registers.r12, 0x08));
+    }
+    static std::mutex mutex;
+    static std::vector<u64> seen;
+    static bool table_logged = false;
+    const u64 key = (site.offset << 24) ^ (caller_offset << 8) ^ static_cast<u8>(role);
+    std::scoped_lock lock{mutex};
+    if (seen.size() >= SignRoleLogLimit || std::ranges::contains(seen, key)) {
+        return;
+    }
+    seen.push_back(key);
+    if (!table_logged && image_base != 0) {
+        table_logged = true;
+        std::string rows;
+        for (const s32 row : {7, 8, 18, 21, 22, 23, 24, 25}) {
+            rows += (rows.empty() ? "" : "; ") + DescribeSignRole(row);
+        }
+        LOG_INFO(Debug, "BBSC sign roles: the game's role table: {}", rows);
+    }
+    const std::string caller =
+        caller_offset != 0 ? fmt::format(" (caller {:#x})", caller_offset) : std::string{};
+    LOG_INFO(Debug, "BBSC sign roles: {} {}{}", what, DescribeSignRole(role), caller);
+    BBSC_TIMELINE("SIGN", "{} {}{}", what, DescribeSignRole(role), caller);
+}
+
 void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
     if (tag >= Sites.size() || registers == nullptr) {
         return;
     }
 
     const auto& site = Sites[tag];
+    LogBbscSignRoles(site, *registers);
     if (site.offset == ItemUsableResultOffset) {
         ApplyBbscBellsAnywhere(registers);
     }
@@ -17140,6 +17219,9 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
             break;
         case TraceKind::LuaSessionEvent:
             WriteLuaSessionEvent(capture_file, *registers);
+            break;
+        case TraceKind::SummonPostBuild:
+            WriteSummonPostBuild(capture_file, *registers);
             break;
         case TraceKind::EnginePanic:
             WriteEnginePanicStack(capture_file, *registers);

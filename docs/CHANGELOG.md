@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-11-03 (e) - role logging for the oath-rune guest that no host rings
+
+- Request: "pero no deberia pasar" (a guest with an oath rune equipped is never rung by the host's search; it
+  joins within ~10 s of taking the rune off; three tests, same password and server).
+- Found (capture p10124, read-only): the guest's own sign is read back with role byte 23 while the rune is on and
+  role 7 afterwards (SummonCandidate.ManagerScan, candidate +0x08; the role changes at the scan right after the
+  rune comes off). SosStatus event_bits stay 32 in both states, so the status the game computes does not change.
+- Found (eboot disassembly, 0x01872360): a search asks the broker only for roles 7, 8, 18, 21-23 and 24-25, each
+  gated by one SosStatus event bit (7: bit 1, 8: bit 4, 18: bit 8, 21-23: bit 0x10, 24-25: bit 0x40). A host
+  without the bit never asks for role 23, which would explain the missing ring. Not yet confirmed: the host's own
+  log, the routine that turns the oath into role 23 (Lua-driven, not found), and whether the broker filters on it.
+- No fix shipped: forcing the role without knowing where it is set could make the guest join as an adversary (the
+  2026-09-16 covenant finding), so only logging was added. New trace site SummonPost.Build (0x01E90E30, the sign
+  body builder; role byte at sign data +0x76) and the log line "BBSC sign roles: <sign posted with | search asks for
+  | sign list holds> role N (wire type, selection mask, role flags) (caller 0x..)", once per new role/caller, 48 at
+  most, also in the timeline as SIGN. The first line also lists the role table rows 7, 8, 18, 21-25.
+- Next test (guest AND host on this DLL): guest with the Hunter rune on, host searches; then rune off. Read the
+  guest's "sign posted with" / "sign list holds" lines and the host's "search asks for" lines.
+
 ## 2026-11-03 (d) - the Dream's workshop checks are found in one memory walk
 
 - Request: "Altar y mesa mas rapidos." The guest's three workshop checks (Memory Altar, workbench gems,

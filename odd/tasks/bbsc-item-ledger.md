@@ -11,14 +11,18 @@ Objective: stop guests permanently losing key items gained in a host's world. Br
 - S6 (user-approved list, item 2): "Que avise cuando algo falla. Hoy tocás la campana y no pasa nada." An on-screen notice appears when a host rang the sign but the join failed, reusing the mod's existing notice mechanism.
 - S7 (item 3): "Que detecte versiones distintas... Debería decir 'tu amigo tiene otra versión' apenas se cruzan." A player meeting an incompatible BBSC build is told so, if the existing channels can carry it; otherwise report what is possible.
 - S8 (item 5): "Altar y mesa más rápidos." The workshop tool checks open well below the current ~90 s after entering the host's Dream, with the same result.
+- S9 (item 6, L3): a guest whose character has an oath (covenant) rune equipped in their own world can still be found and summoned for co-op, the same as without it. Invasions, PvP, the duel bell and covenant rewards stay as they are, and the guest still joins as a friendly phantom, never as an adversary.
 ## Tasks
 - T1 | S1-S5 | delegated (context backstop) | status: built (CI pending), in-game untested | commit: see git log (feat(mod): note key items taken as a guest...)
 
 - T2 | S6 | delegated (context backstop) | status: built (CI pending), in-game untested | commit: feat(mod): tell the guest when a host's bell did not become a join
 - T3 | S7 | delegated (context backstop) | status: built (CI pending), in-game untested | commit: feat(mod): warn a guest when the host that rang runs another BBSC
 - T4 | S8 | delegated (context backstop) | status: built (CI pending), in-game untested, speed unmeasured | commit: perf(mod): find the Dream's workshop checks in one memory walk
+- T5 | S9 | inline (no Write-rule reason) | status: cause narrowed, check not yet named; role logging built (CI pending), in-game untested | commit: feat(mod): log the sign role a guest posts and a host asks for
 ## Log
 - L1 (2026-11-03, user, on "Que no se pierdan objetos clave... ¿Querés que la haga en nuestro fork?"): "ok"
 - Engram mirror pending: this session ran from the home directory; project scope unresolved.
 - 2026-11-03 T1 written by one delegated writer (inline in its own context): hook on 0x016D8850 (give windows only), per-character file item-ledger/owed-<user>-<slot>.txt, restore at home via GiveBbscBossGoods, switch SHADPS4_BBSC_ITEM_LEDGER=0. No unit runner: pure parse/format helpers not compiled standalone (no local toolchain). S1-S5 covered in code; S1 needs an in-game test. Out of scope: repairing old guest-items entries.
 - L2 (2026-11-03, user, on grouping items 1, 2, 3 and 5 into one DLL for one test session): "si"
+- L3 (2026-11-03, user): "pero no deberia pasar"
+- 2026-11-03 T5 inline: capture p10124 shows the guest's own sign with role 23 while the Hunter oath rune is on and role 7 after it comes off (ManagerScan, same minute the host rang); SosStatus event_bits stay 32 either way. 0x01872360 (SosStatus.Update) asks a search for roles 7 (bit 1), 8, 18, 21-23 (bit 0x10), 24-25 only, so a role-23 sign is not asked for by a plain host. The routine that sets the role is not found yet, so no patch is shipped; only read-only role logging (SummonPost.Build 0x01E90E30, InsertType, ManagerScan). Next test: guest with the rune on, then off; read the `BBSC sign roles:` lines of both players.
