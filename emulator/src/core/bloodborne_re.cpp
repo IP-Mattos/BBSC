@@ -6453,13 +6453,22 @@ void TickBbscHostTime() {
 // the character that was left, not the one loaded since, so no file is recovered.
 std::optional<std::filesystem::file_time_type> bbsc_parked_save_time;
 
-bool RecoverBbscOwnWorldFile(const BbscSaveSlot& slot) {
+// False until a save newer than the last quit to the title exists: before that, BbscActiveSaveSlot
+// may still name the character that was left.
+bool BbscSaveSlotTrusted() {
     if (bbsc_parked_save_time.has_value()) {
         BbscActiveSaveSlot(); // refreshes bbsc_active_save_time
         if (bbsc_active_save_time <= *bbsc_parked_save_time) {
             return false;
         }
         bbsc_parked_save_time.reset();
+    }
+    return true;
+}
+
+bool RecoverBbscOwnWorldFile(const BbscSaveSlot& slot) {
+    if (!BbscSaveSlotTrusted()) {
+        return false;
     }
     if (!bbsc_own_world.empty() || !BbscHomeForOwnWorld() || !LoadBbscOwnWorldFile(slot)) {
         return false;
@@ -7072,7 +7081,11 @@ void OnBbscChaliceLoad(const GuestRegisterSnapshot& registers) {
 // Quit to title: another character can be loaded next, so the journal goes to its file and leaves
 // memory; the file is found again by its character's slot (RecoverBbscOwnWorldFile). Without a file on
 // disk (no save slot known yet) it stays in memory, as nothing else can hold it.
+void ResetBbscOwedDropsForQuit(); // see "Enemy drops for the guest"
 void ParkBbscOwnWorld(std::string_view why) {
+    BbscActiveSaveSlot(); // refreshes bbsc_active_save_time
+    bbsc_parked_save_time = bbsc_active_save_time;
+    ResetBbscOwedDropsForQuit();
     if (bbsc_own_world.empty()) {
         return;
     }
@@ -7084,8 +7097,6 @@ void ParkBbscOwnWorld(std::string_view why) {
     LOG_INFO(Debug, "BBSC own world ({}): {} kept group(s) left in user {} slot {}'s file, memory cleared",
              why, bbsc_own_world.size(), bbsc_own_world_slot->user, bbsc_own_world_slot->slot);
     BBSC_TIMELINE("WORLD", "own world ({}): kept groups left in the file, memory cleared", why);
-    BbscActiveSaveSlot(); // refreshes bbsc_active_save_time
-    bbsc_parked_save_time = bbsc_active_save_time;
     bbsc_own_world.clear();
     bbsc_own_world_dirty = false;
     bbsc_own_world_slot.reset();
@@ -11816,7 +11827,18 @@ std::vector<BbscOwedDrop> ReadBbscOwedDrops(const std::filesystem::path& path) {
     try {
         std::ifstream file(path);
         std::string line;
-        if (!file || !std::getline(file, line) || line.rfind("BBSC-OWED-DROPS 1", 0) != 0) {
+        if (!file) {
+            return drops;
+        }
+        if (!std::getline(file, line) || line.rfind("BBSC-OWED-DROPS 1", 0) != 0) {
+            if (file.eof() && line.empty()) {
+                return drops; // an empty file
+            }
+            file.close();
+            std::error_code ec;
+            std::filesystem::rename(path, std::filesystem::path(path).concat(".bad"), ec);
+            LOG_WARNING(Debug, "BBSC guest drop: {} has an unknown header - kept aside as .bad",
+                        path.string());
             return drops;
         }
         while (std::getline(file, line)) {
@@ -11850,7 +11872,9 @@ bool WriteBbscOwedDrops(const std::filesystem::path& path, const std::vector<Bbs
                 file << d.lot << ' ' << d.entry << ' ' << d.category << ' ' << d.item << ' '
                      << d.flag << '\n';
             }
+            file.close();
             if (!file) {
+                std::filesystem::remove(temp, ec);
                 return false;
             }
         }
@@ -11862,14 +11886,27 @@ bool WriteBbscOwedDrops(const std::filesystem::path& path, const std::vector<Bbs
     }
 }
 
-// Empty when queued, else why not.
-std::string_view QueueBbscOwedDrop(const BbscOwedDrop& drop) {
-    const auto slot = BbscActiveSaveSlot();
-    if (!slot.has_value()) {
-        return "the character is not known yet";
-    }
+// Rolled while the save slot is not trusted (BbscSaveSlotTrusted): kept here, not on disk, until a
+// save shows whose character this is. A quit to the title drops them (ResetBbscOwedDropsForQuit),
+// because after a quit the character that gets the save may not be the one that rolled them.
+std::vector<BbscOwedDrop> bbsc_held_owed_drops;
+std::atomic<u32> bbsc_owed_generation{0}; // counts quits: the delivery tick forgets its list
+constexpr std::string_view BbscOwedHeld = "held until this character has saved";
+
+void ResetBbscOwedDropsForQuit() {
     std::scoped_lock lock{bbsc_owed_drops_mutex};
-    const auto path = BbscOwedDropsPath(*slot);
+    if (!bbsc_held_owed_drops.empty()) {
+        LOG_WARNING(Debug, "BBSC guest drop: quit to the title with {} drop(s) not yet kept - "
+                           "dropped, they could belong to another character",
+                    bbsc_held_owed_drops.size());
+        bbsc_held_owed_drops.clear();
+    }
+    bbsc_owed_generation.fetch_add(1);
+}
+
+// Appends to the list of `slot`; the reason when the drop was not added, else empty. Needs the lock.
+std::string_view AddBbscOwedDropLocked(const BbscSaveSlot& slot, const BbscOwedDrop& drop) {
+    const auto path = BbscOwedDropsPath(slot);
     auto drops = ReadBbscOwedDrops(path);
     if (drops.size() >= 100) {
         return "the list owed at home is full";
@@ -11880,6 +11917,42 @@ std::string_view QueueBbscOwedDrop(const BbscOwedDrop& drop) {
     }
     drops.push_back(drop);
     return WriteBbscOwedDrops(path, drops) ? std::string_view{} : "the list could not be saved";
+}
+
+// Held drops go to the file once the slot can be trusted.
+void FlushBbscHeldOwedDrops() {
+    std::scoped_lock lock{bbsc_owed_drops_mutex};
+    if (bbsc_held_owed_drops.empty() || !BbscSaveSlotTrusted()) {
+        return;
+    }
+    const auto slot = BbscActiveSaveSlot();
+    if (!slot.has_value()) {
+        return;
+    }
+    for (const BbscOwedDrop& drop : bbsc_held_owed_drops) {
+        const std::string_view why = AddBbscOwedDropLocked(*slot, drop);
+        LOG_INFO(Debug, "BBSC guest drop: held item {} from lot {} for user {} slot {}: {}",
+                 drop.item, drop.lot, slot->user, slot->slot,
+                 why.empty() ? "owed, awarded at home" : why);
+    }
+    bbsc_held_owed_drops.clear();
+}
+
+// Empty when owed, BbscOwedHeld when kept in memory for now, else why not.
+std::string_view QueueBbscOwedDrop(const BbscOwedDrop& drop) {
+    std::scoped_lock lock{bbsc_owed_drops_mutex};
+    const auto slot = BbscSaveSlotTrusted() ? BbscActiveSaveSlot() : std::nullopt;
+    if (!slot.has_value()) {
+        if (bbsc_held_owed_drops.size() >= 100 ||
+            (drop.flag > 0 && std::ranges::any_of(bbsc_held_owed_drops, [&drop](const auto& d) {
+                return d.flag == drop.flag;
+            }))) {
+            return "the list owed at home is full or has that one-time drop";
+        }
+        bbsc_held_owed_drops.push_back(drop);
+        return BbscOwedHeld;
+    }
+    return AddBbscOwedDropLocked(*slot, drop);
 }
 
 void GiveBbscGuestDrop(s32 lot, u32 name) {
@@ -11937,11 +12010,13 @@ void GiveBbscGuestDrop(s32 lot, u32 name) {
         LOG_INFO(Debug, "BBSC guest drop: enemy (name id {}) dropped a {} (id {}, lot {}) - {}", name,
                  kind, item, lot,
                  why.empty() ? std::string{"owed, awarded at home"}
-                             : fmt::format("not kept: {}", why));
+                 : why == BbscOwedHeld ? std::string{BbscOwedHeld}
+                                       : fmt::format("not kept: {}", why));
         BBSC_TIMELINE("ITEMS", "guest drop: a {} (id {}, lot {}) {}", kind, item, lot,
-                      why.empty() ? "owed, awarded at home" : "not kept");
+                      why.empty() ? "owed, awarded at home"
+                      : why == BbscOwedHeld ? "held for now" : "not kept");
         static s64 owed_notice_ms = 0;
-        if (why.empty() && SteadyNowMs() - owed_notice_ms > 15'000) {
+        if ((why.empty() || why == BbscOwedHeld) && SteadyNowMs() - owed_notice_ms > 15'000) {
             owed_notice_ms = SteadyNowMs();
             BbscAnnounce(u"A drop will reach you when you are back home.", "enemy drop owed");
         }
@@ -12008,15 +12083,29 @@ void TickBbscGuestDrops() {
     }
 }
 
-// Game tick, at home and settled: award the drops owed from sessions, one every 3 s.
+// Game tick, at home and settled: award the drops owed from sessions, one every 10 s (the code has
+// no way to tell an open item popup, so the pace stands in for it).
 void TickBbscOwedDrops() {
     static const bool enabled = EnvFlagEnabled("SHADPS4_BBSC_GUEST_ITEMS");
     static s64 home_since_ms = 0;
+    static s64 check_ms = 0;
     static s64 last_ms = 0;
     static bool loaded = false;
+    static u32 generation = 0;
     static std::vector<BbscOwedDrop> pending;
     if (!enabled || image_base == 0) {
         return;
+    }
+    const s64 now = SteadyNowMs();
+    if (now - check_ms < 5'000) {
+        return;
+    }
+    check_ms = now;
+    FlushBbscHeldOwedDrops();
+    if (generation != bbsc_owed_generation.load()) {
+        generation = bbsc_owed_generation.load();
+        loaded = false;
+        pending.clear();
     }
     const u64 global = GetGlobalState();
     if (GetSessionState() != 0 || !ReadablePointer(global, 0x1593) ||
@@ -12027,26 +12116,36 @@ void TickBbscOwedDrops() {
         pending.clear();
         return;
     }
-    const s64 now = SteadyNowMs();
     if (home_since_ms == 0) {
         home_since_ms = now;
     }
-    if (now - home_since_ms < 5'000 || now - last_ms < 3'000) {
+    if (now - home_since_ms < 5'000) {
         return;
     }
-    const auto slot = BbscActiveSaveSlot();
-    if (!slot.has_value()) {
-        return;
-    }
-    const auto path = BbscOwedDropsPath(*slot);
+    // One save-folder lookup per arrival at home; with nothing owed, later ticks stop here.
+    std::optional<BbscSaveSlot> slot;
     if (!loaded) {
+        if (!BbscSaveSlotTrusted()) {
+            return;
+        }
+        slot = BbscActiveSaveSlot();
+        if (!slot.has_value()) {
+            return;
+        }
         std::scoped_lock lock{bbsc_owed_drops_mutex};
-        pending = ReadBbscOwedDrops(path);
+        pending = ReadBbscOwedDrops(BbscOwedDropsPath(*slot));
         loaded = true;
     }
-    if (pending.empty()) {
+    if (pending.empty() || now - last_ms < 10'000) {
         return;
     }
+    if (!slot.has_value()) {
+        slot = BbscActiveSaveSlot();
+        if (!slot.has_value()) {
+            return;
+        }
+    }
+    const auto path = BbscOwedDropsPath(*slot);
     const u64 item_man = ReadValue<u64>(image_base + ItemManPointerOffset, 0);
     const u64 table = BbscGameParamTable("ITEMLOT_PARAM_ST");
     if (!ReadablePointer(item_man, 0x10) || table == 0) {

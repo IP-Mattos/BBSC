@@ -29,7 +29,7 @@ Not tested in game:
 - Workshop checks are found in one memory walk (FindAnyInMemory), retried every 20 s up to 4 times per Dream visit.
 - Enemy drops for a guest (SHADPS4_BBSC_GUEST_ITEMS): goods that do not fit the carried items go to the storage box, and a
   partial fit sends the rest there (log: "put into the storage box", "no room" with both fit answers). Weapons, blood gems
-  and attire are kept in guest-items/owed-drops-<user>-<slot>.txt and awarded at home, one every 3 s, by the game's award
+  and attire are kept in guest-items/owed-drops-<user>-<slot>.txt and awarded at home, one every 10 s, by the game's award
   0x017DDC50 with the other entries of the lot's row zeroed for the call; a line is removed before its award. Category 15 is
   still not given. Whether the award takes the changed row, and the cause of the "did not fit" lines (indicated: a stack at
   its carry limit), were not checked.
