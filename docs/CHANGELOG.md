@@ -9,8 +9,12 @@ Tested in game with two players:
 - Guest can use the altar and workbench in the host's Dream.
 
 Not tested in game:
-- A guest no longer follows a host into a Chalice Dungeon: area 29 has one map id for every dungeon and the follow packet
-  has no dungeon id, so the guest loaded a stub. Chalice co-op is not supported yet.
+- A guest follows a host into a Chalice Dungeon with the host's dungeon: area 29 has one map id for every dungeon, so the
+  host sends flag groups 94000+100*slot and 94001+100*slot plus the 9020 bits (SignalingBbscWorldFlags version 3, about
+  once a second, again when they change). The guest keeps its own copy in own-world/ (file), writes them, reads 9020 back
+  and only then loads map 0x1D000000; if the record is missing or does not read back it stays out as before. Written
+  again at 0x01928680 for area 29. Own record and 9020 bits come back on leaving the dungeon, at home, or after a crash.
+  Doors, levers and bosses inside the dungeon are not synced and may differ between players. Lines start "BBSC chalice:".
 - A guest who died and was left in the host's world after the session ended is sent home too (gray screen).
 - Boss rewards awarded by a follow-up event reach the guest: Logarius (12501800, Crown of Illusions, lot 2502000) and
   m35 (13501800, Celestial Dial, lot 3501800). The other template events are already in the table.

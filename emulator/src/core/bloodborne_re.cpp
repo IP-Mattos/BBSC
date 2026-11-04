@@ -358,6 +358,10 @@ constexpr auto Sites = std::to_array<TraceSite>({
     {"BBSC.Items.PlaceTreasure", 0x017DC300, TraceKind::MatchingLeaveDecision, StandardR15Prologue,
      6},
     {"BBSC.Items.NumberKind1", 0x017D4C40, TraceKind::MatchingLeaveDecision, StandardR15Prologue, 6},
+    // Chalice Dungeon load setup (rsi+8 = the map; area 29 reads the dungeon slot from flags 9020..)
+    // and its loader (rsi = the layout record, first u32 -1 returns at once).
+    {"BBSC.Chalice.Load", 0x01928680, TraceKind::MatchingLeaveDecision, StandardR15Prologue, 6},
+    {"BBSC.Chalice.Loader", 0x01FF8D20, TraceKind::MatchingLeaveDecision, StandardR15Prologue, 6},
     {"CSRequestSummon.Init", 0x014B47C0, TraceKind::SummonRequest, StandardR15Prologue, 6},
     {"CSRequestSummon.Update", 0x014B4890, TraceKind::SummonRequest, StandardRbxPrologue, 5},
     {"CSRequestSummon.CheckWait", 0x014B48C0, TraceKind::SummonRequest, StandardR15Prologue, 6},
@@ -3300,6 +3304,7 @@ void KeepBbscHomeSpot();                              // see "Back home where we
 void CaptureBbscOwnWorldBeforeJoin();
 void WriteBbscOwnWorldFile();
 void NoteBbscOwnDreamRestored(u32 key, const u8* live);
+void RestoreBbscOwnChaliceBits(std::string_view why); // see "Chalice Dungeon record"
 s32 GetSessionState();
 u32 GetCurrentPackedMap();
 // The map as of the last game tick, for code on other threads (the relay's placement packets):
@@ -4744,6 +4749,9 @@ constexpr u32 BbscDreamStateMap = 0x15000000;
 bool BbscHostDreamStateReady();
 void ApplyBbscHostDreamState(std::string_view why);
 void RestoreBbscOwnDreamState(std::string_view why);
+// The host's Chalice Dungeon record is in our flags and read back, see "Chalice Dungeon record".
+bool BbscChaliceFollowReady();
+constexpr u32 BbscChaliceLoadMap = 0x1D000000;
 
 // Host side: say where we are, so a guest that is somewhere else can come to us.
 void TickBbscFollowBroadcast() {
@@ -4922,21 +4930,24 @@ void TickBbscFollowHost() {
         !IsUsablePackedMap(host.packed_map)) {
         return; // the host is not telling us anything we can act on
     }
-    // Area 29 is one map id for every Chalice Dungeon and the packet has no dungeon id, so a follow
-    // would load a stub instead of the host's dungeon.
+    // Area 29 is one map id for every Chalice Dungeon and the packet has no dungeon id: the guest
+    // follows only with the host's dungeon record in its flags (see "Chalice Dungeon record").
     static bool chalice_told = false;
     if ((host.packed_map >> 24) == 29) {
-        if (!chalice_told) {
-            chalice_told = true;
-            BbscAnnounce(u"The host is in a Chalice Dungeon. You can't follow there yet.",
-                         "chalice follow");
-            LOG_WARNING(Debug, "BBSC warp together: host in Chalice map {:#x}, not following",
-                        host.packed_map);
-            BBSC_TIMELINE("WARP", "host in Chalice map {:#x}, not following", host.packed_map);
+        if (!warping && !BbscChaliceFollowReady()) {
+            if (!chalice_told) {
+                chalice_told = true;
+                BbscAnnounce(u"The host is in a Chalice Dungeon. You can't follow there yet.",
+                             "chalice follow");
+                LOG_WARNING(Debug, "BBSC warp together: host in Chalice map {:#x}, not following",
+                            host.packed_map);
+                BBSC_TIMELINE("WARP", "host in Chalice map {:#x}, not following", host.packed_map);
+            }
+            return;
         }
-        return;
-    }
-    if (chalice_told) {
+        chalice_told = false;
+        host.packed_map = BbscChaliceLoadMap; // the load forces this map whatever the host's id
+    } else {
         chalice_told = false;
     }
 
@@ -5199,6 +5210,7 @@ constexpr size_t BbscDreamGroupCount = BbscDreamStateKeys.size();
 constexpr size_t BbscDreamChunkCount =
     (BbscDreamGroupCount + BbscWorldChunkGroups - 1) / BbscWorldChunkGroups;
 constexpr size_t BbscSnapshotMaxGroups = 64;
+constexpr u8 BbscChalicePacketVersion = 3; // the host's Chalice Dungeon record
 static_assert(BbscDreamGroupCount <= BbscSnapshotMaxGroups && BbscDreamChunkCount <= 8);
 
 bool BbscWorldSyncEnabled() {
@@ -6050,6 +6062,7 @@ constexpr u32 BbscTimeGroupKey = 9;
 constexpr size_t BbscTimeByte = 100;
 constexpr u8 BbscTimeMask = 0xE0;
 constexpr u32 BbscOwnTimeKey = 0xFFFF9800;
+constexpr u32 BbscOwnChaliceKey = 0xFFFF9020; // pseudo group: byte 0 = our 9020 bits, byte 1 = 1 when kept
 constexpr s64 BbscHostTimeFreshMs = 120'000;
 // Guest: the host's night from its last progress packet (-1 = not known yet).
 std::atomic<s32> bbsc_host_time_bits{-1};
@@ -6253,8 +6266,8 @@ size_t RestoreBbscOwnWorld(std::string_view why) {
     size_t bits = 0;
     size_t missing = 0;
     for (const auto& [key, own] : bbsc_own_world) {
-        if (key == BbscOwnTimeKey) {
-            continue; // our own night: put back below, after every real group
+        if (key == BbscOwnTimeKey || key == BbscOwnChaliceKey) {
+            continue; // our own night and Chalice bits: put back below, after every real group
         }
         const u64 storage = BbscFlagGroupStorage(key);
         if (storage == 0) {
@@ -6302,6 +6315,7 @@ size_t RestoreBbscOwnWorld(std::string_view why) {
                           BbscTimeName(own), BbscTimeName(live & BbscTimeMask));
         }
     }
+    RestoreBbscOwnChaliceBits(why);
     bbsc_own_world.clear();
     bbsc_own_world_dirty = false;
     if (bbsc_own_world_slot.has_value()) {
@@ -6409,6 +6423,549 @@ void TickBbscOwnWorld() {
 void RestoreBbscOwnWorldAtLoad() {
     if (!bbsc_own_world.empty()) {
         RestoreBbscOwnWorld("during the home load");
+    }
+}
+
+// ---- Chalice Dungeon record -----------------------------------------------------------------------
+// Area 29 is one map id for every Chalice Dungeon. The load setup (0x01928680) takes the dungeon from
+// the event flags: slot = 7 - bitlength(flags 9020..9026, read as one 7-bit value) and the record at
+// flag 94000000 + slot * 100000, which sits in the flag groups 94000 + 100 * slot and 94001 + 100 *
+// slot (current layout id first). Without the host's record the guest loads a stub. The host sends
+// both groups and the 9020 value (version 3 of SignalingBbscWorldFlags, ignored by older builds); the
+// guest keeps its own copy in the own world journal (file included), writes them, reads the 9020 bits
+// back through the game and only then follows. A save written meanwhile takes the event flags from the
+// live table, so the journal's file is what puts the guest's own record back after a crash.
+constexpr u64 BbscReadFlagBitsOffset = 0x013CFD80;  // (man, flag, bits) -> value, first flag = top bit
+constexpr u64 BbscWriteFlagBitsOffset = 0x013D0060; // (man, flag, bits, value)
+constexpr u32 BbscChaliceSlotFlag = 9020;
+constexpr u32 BbscChaliceSlotBits = 7;
+constexpr u32 BbscChaliceRecordFlag = 94'000'000; // + slot * 100000
+constexpr size_t BbscChaliceGroups = 2;
+constexpr s64 BbscChaliceSendMs = 1'000;
+constexpr s64 BbscChaliceResendMs = 5'000;
+constexpr s64 BbscChaliceFreshMs = 15'000;
+constexpr s64 BbscChaliceLeaveMs = 30'000;
+
+u64 BbscFnv1a(const void* data, size_t size, u64 hash = 0xCBF29CE484222325ull) {
+    const auto* bytes = static_cast<const u8*>(data);
+    for (size_t i = 0; i < size; ++i) {
+        hash = (hash ^ bytes[i]) * 0x100000001B3ull;
+    }
+    return hash;
+}
+
+u64 BbscFlagMan() {
+    const u64 man = ReadValue<u64>(image_base + WorldFlagManPointerOffset, 0);
+    return ReadablePointer(man, 0x40) ? man : 0;
+}
+
+// Both flag functions start with this; checked before the first call.
+bool BbscFlagFunctionsOk() {
+    if (image_base == 0) {
+        return false;
+    }
+    static const bool ok = [] {
+        constexpr std::array<u8, 6> prologue{0x55, 0x41, 0x57, 0x41, 0x56, 0x53};
+        for (const u64 offset : {BbscReadFlagBitsOffset, BbscWriteFlagBitsOffset}) {
+            if (!HasMemoryAccess(image_base + offset, prologue.size(), MemoryProt::CpuRead) ||
+                std::memcmp(reinterpret_cast<const void*>(image_base + offset), prologue.data(),
+                            prologue.size()) != 0) {
+                return false;
+            }
+        }
+        return true;
+    }();
+    return ok;
+}
+
+bool BbscReadFlagBits(u32 flag, u32 bits, u32& value) {
+    const u64 man = BbscFlagMan();
+    if (man == 0 || !BbscFlagFunctionsOk()) {
+        return false;
+    }
+    using ReadBits = u32 PS4_SYSV_ABI (*)(u64 man, u32 flag, u32 bits);
+    value = reinterpret_cast<ReadBits>(image_base + BbscReadFlagBitsOffset)(man, flag, bits);
+    return true;
+}
+
+bool BbscWriteFlagBits(u32 flag, u32 bits, u32 value) {
+    const u64 man = BbscFlagMan();
+    if (man == 0 || !BbscFlagFunctionsOk()) {
+        return false;
+    }
+    using WriteBits = void PS4_SYSV_ABI (*)(u64 man, u32 flag, u32 bits, u32 value);
+    reinterpret_cast<WriteBits>(image_base + BbscWriteFlagBitsOffset)(man, flag, bits, value);
+    return true;
+}
+
+// 7 (invalid) when no 9020 flag is set.
+constexpr u32 BbscChaliceSlotOf(u32 bits) {
+    return BbscChaliceSlotBits - static_cast<u32>(std::bit_width(bits & 0x7F));
+}
+
+constexpr u32 BbscChaliceKey(u32 slot, size_t index) {
+    return 94'000 + 100 * slot + static_cast<u32>(index);
+}
+
+// The layout id as the game reads it (record flag +0x000, 32 bits); 0 when the table is missing.
+u32 BbscChaliceLiveLayout(u32 slot) {
+    u32 layout = 0;
+    BbscReadFlagBits(BbscChaliceRecordFlag + slot * 100'000, 32, layout);
+    return layout;
+}
+
+u32 BbscChaliceBytesLayout(const u8* group) {
+    return static_cast<u32>(group[0]) << 24 | static_cast<u32>(group[1]) << 16 |
+           static_cast<u32>(group[2]) << 8 | group[3];
+}
+
+struct BbscChaliceRecord {
+    u32 sequence = 0;
+    u32 slot = 7;
+    u32 bits = 0;
+    std::array<std::array<u8, BbscWorldGroupBytes>, BbscChaliceGroups> groups{};
+    u64 hash = 0; // of both groups
+    u64 key = 0;  // of the groups, slot and bits: changes when anything the guest writes changes
+    s64 received_ms = 0;
+};
+
+void BbscChaliceHashRecord(BbscChaliceRecord& record) {
+    record.hash = BbscFnv1a(record.groups[1].data(), BbscWorldGroupBytes,
+                            BbscFnv1a(record.groups[0].data(), BbscWorldGroupBytes));
+    const std::array<u32, 2> extra{record.slot, record.bits};
+    record.key = BbscFnv1a(extra.data(), sizeof(extra), record.hash);
+}
+
+std::mutex bbsc_chalice_mutex;
+BbscChaliceRecord bbsc_chalice_host; // guest: the newest valid record from the host
+
+// Arrives on the signaling receive thread: records the message only.
+void OnBbscChaliceRecordPacket(const Libraries::Np::NpSignaling::SignalingBbscWorldFlags& packet) {
+    const u32 slot = packet.groups[2][0];
+    const u32 bits = packet.groups[2][1];
+    if (packet.chunk != 0 || packet.chunk_count != 1 || packet.group_count != 3 ||
+        (packet.present & 3) != 3 || packet.groups[2][2] != 1 ||
+        BbscMapArea(packet.packed_map) != BbscChaliceArea || slot > 6 || std::popcount(bits) != 1 ||
+        BbscChaliceSlotOf(bits) != slot) {
+        return;
+    }
+    BbscChaliceRecord record;
+    record.sequence = packet.snapshot;
+    record.slot = slot;
+    record.bits = bits;
+    for (size_t i = 0; i < BbscChaliceGroups; ++i) {
+        std::memcpy(record.groups[i].data(), packet.groups[i], BbscWorldGroupBytes);
+    }
+    BbscChaliceHashRecord(record);
+    record.received_ms = SteadyNowMs();
+    static u64 logged_key = 0;
+    bool log = false;
+    {
+        std::scoped_lock lock{bbsc_chalice_mutex};
+        // A host that restarted counts from 1 again: an older number only loses while the last is fresh.
+        if (bbsc_chalice_host.received_ms != 0 && record.sequence <= bbsc_chalice_host.sequence &&
+            record.received_ms - bbsc_chalice_host.received_ms < BbscChaliceFreshMs) {
+            return;
+        }
+        bbsc_chalice_host = record;
+        log = record.key != logged_key;
+        logged_key = record.key;
+    }
+    if (log) {
+        LOG_INFO(Debug,
+                 "BBSC chalice: host record received - slot {}, 9020 {:#04x}, layout id {:#x}, "
+                 "groups hash {:016x}, sequence {}",
+                 slot, bits, BbscChaliceBytesLayout(record.groups[0].data()), record.hash,
+                 record.sequence);
+        BBSC_TIMELINE("CHALICE", "host record received - slot {}, 9020 {:#04x}, layout id {:#x}, "
+                      "groups hash {:016x}",
+                      slot, bits, BbscChaliceBytesLayout(record.groups[0].data()), record.hash);
+    }
+}
+
+// Host side: while we stand in a Chalice Dungeon, the record and the 9020 bits to the guest(s).
+void TickBbscChaliceBroadcast() {
+    static s64 last_ms = 0;
+    static s64 sent_ms = 0;
+    static u32 sequence = 0;
+    static u64 sent_key = 0;
+    static u64 logged_key = 0;
+    if (!BbscWorldSyncEnabled() || !BbscWarpTogetherEnabled() || image_base == 0) {
+        return;
+    }
+    const s64 now = SteadyNowMs();
+    if (now - last_ms < BbscChaliceSendMs) {
+        return;
+    }
+    last_ms = now;
+    const u64 global = GetGlobalState();
+    if (GetSessionState() != 3 || !ReadablePointer(global, 0x1598) ||
+        ReadValue<u8>(global, 0x1592) == 0 || ReadValue<u8>(global, 0x08) != 0) {
+        return; // not hosting in our own world, or a load is running
+    }
+    const u32 map = GetCurrentPackedMap();
+    if (BbscMapArea(map) != BbscChaliceArea) {
+        return;
+    }
+    BbscChaliceRecord record;
+    u32 bits = 0;
+    if (!BbscReadFlagBits(BbscChaliceSlotFlag, BbscChaliceSlotBits, bits)) {
+        return;
+    }
+    record.bits = bits;
+    record.slot = BbscChaliceSlotOf(bits);
+    if (record.slot > 6 || std::popcount(bits) != 1) {
+        if (logged_key != 1) {
+            logged_key = 1;
+            LOG_WARNING(Debug, "BBSC chalice: host slot {} (9020 {:#04x}) is not a dungeon slot, "
+                               "nothing to send",
+                        record.slot, bits);
+        }
+        return;
+    }
+    for (size_t i = 0; i < BbscChaliceGroups; ++i) {
+        const u64 storage = BbscFlagGroupStorage(BbscChaliceKey(record.slot, i));
+        if (storage == 0) {
+            return;
+        }
+        std::memcpy(record.groups[i].data(), reinterpret_cast<const void*>(storage),
+                    BbscWorldGroupBytes);
+    }
+    BbscChaliceHashRecord(record);
+    if (record.key == sent_key && now - sent_ms < BbscChaliceResendMs) {
+        return;
+    }
+    Libraries::Np::NpSignaling::SignalingBbscWorldFlags packet{};
+    packet.version = BbscChalicePacketVersion;
+    packet.packed_map = map;
+    packet.snapshot = ++sequence;
+    packet.chunk = 0;
+    packet.chunk_count = 1;
+    packet.present = 3;
+    packet.group_count = 3; // the two groups, then slot / 9020 bits / valid
+    for (size_t i = 0; i < BbscChaliceGroups; ++i) {
+        std::memcpy(packet.groups[i], record.groups[i].data(), BbscWorldGroupBytes);
+    }
+    packet.groups[2][0] = static_cast<u8>(record.slot);
+    packet.groups[2][1] = static_cast<u8>(bits);
+    packet.groups[2][2] = 1;
+    const u32 sent = Libraries::Np::NpSignaling::Helpers::SendBbscWorldFlagsToPeers(
+        &packet, sizeof(packet));
+    sent_key = record.key;
+    sent_ms = now;
+    if (record.key != logged_key) {
+        logged_key = record.key;
+        const u32 layout = BbscChaliceLiveLayout(record.slot);
+        LOG_INFO(Debug,
+                 "BBSC chalice: host slot {}, 9020 {:#04x}, layout id {:#x}, groups hash {:016x}, "
+                 "sent to {} peer(s) (sequence {})",
+                 record.slot, bits, layout, record.hash, sent, sequence);
+        BBSC_TIMELINE("CHALICE", "host slot {}, 9020 {:#04x}, layout id {:#x}, groups hash {:016x}, "
+                      "sent to {} peer(s)",
+                      record.slot, bits, layout, record.hash, sent);
+    }
+}
+
+struct BbscChaliceApplied {
+    bool active = false;
+    u64 key = 0;
+    s64 applied_ms = 0;
+};
+BbscChaliceApplied bbsc_chalice_applied; // game thread only
+
+bool KeepBbscOwnChaliceBits() {
+    if (bbsc_own_world.contains(BbscOwnChaliceKey)) {
+        return true;
+    }
+    u32 bits = 0;
+    if (const auto group = bbsc_own_world.find(BbscTimeGroupKey); group != bbsc_own_world.end()) {
+        // A Dream visit kept group 9 first: those bytes are ours, the live ones may be the host's.
+        // Flags 9020..9026 are bits 20..26 of the group, the first one the top bit of the value.
+        bits = (static_cast<u32>(group->second[2] & 0x0F) << 3) | (group->second[3] >> 5);
+    } else if (!BbscReadFlagBits(BbscChaliceSlotFlag, BbscChaliceSlotBits, bits)) {
+        return false;
+    }
+    std::array<u8, BbscWorldGroupBytes> pseudo{};
+    pseudo[0] = static_cast<u8>(bits);
+    pseudo[1] = 1;
+    bbsc_own_world[BbscOwnChaliceKey] = pseudo;
+    bbsc_own_world_dirty = true;
+    return true;
+}
+
+// Our own 9020 bits from the journal into the live flags; true when they read back.
+bool PutBbscOwnChaliceBits(u32& own, u32& was) {
+    const auto it = bbsc_own_world.find(BbscOwnChaliceKey);
+    if (it == bbsc_own_world.end() || it->second[1] != 1) {
+        return true; // nothing kept
+    }
+    own = it->second[0];
+    was = 0;
+    BbscReadFlagBits(BbscChaliceSlotFlag, BbscChaliceSlotBits, was);
+    u32 back = 0;
+    return BbscWriteFlagBits(BbscChaliceSlotFlag, BbscChaliceSlotBits, own) &&
+           BbscReadFlagBits(BbscChaliceSlotFlag, BbscChaliceSlotBits, back) && back == own;
+}
+
+// Called by RestoreBbscOwnWorld after the real groups (they are back already): the 9020 bits.
+void RestoreBbscOwnChaliceBits(std::string_view why) {
+    size_t groups = 0;
+    for (const auto& entry : bbsc_own_world) {
+        const u32 key = entry.first;
+        groups += key >= 94'000 && key < 94'700 && key % 100 < BbscChaliceGroups ? 1 : 0;
+    }
+    u32 own = 0;
+    u32 was = 0;
+    const bool kept = bbsc_own_world.contains(BbscOwnChaliceKey);
+    const bool ok = PutBbscOwnChaliceBits(own, was);
+    if (kept || groups != 0) {
+        LOG_INFO(Debug,
+                 "BBSC chalice: restore ({}) - our own record groups ({}) and 9020 bits back, "
+                 "{:#04x} (was {:#04x}), read back {}",
+                 why, groups, own, was, ok ? "ok" : "FAILED");
+        BBSC_TIMELINE("CHALICE", "restore ({}) - our own record groups ({}) and 9020 bits {:#04x} "
+                      "back (was {:#04x}), read back {}",
+                      why, groups, own, was, ok ? "ok" : "FAILED");
+    }
+    bbsc_chalice_applied = {};
+}
+
+// Our own record back while the journal stays (leaving the dungeon, a write that did not read back).
+void RestoreBbscChaliceOwn(std::string_view why) {
+    size_t groups = 0;
+    for (u32 slot = 0; slot < BbscChaliceSlotBits; ++slot) {
+        for (size_t i = 0; i < BbscChaliceGroups; ++i) {
+            const u32 key = BbscChaliceKey(slot, i);
+            const auto it = bbsc_own_world.find(key);
+            const u64 storage = it != bbsc_own_world.end() ? BbscFlagGroupStorage(key) : 0;
+            if (storage == 0) {
+                continue;
+            }
+            std::memcpy(reinterpret_cast<void*>(storage), it->second.data(), BbscWorldGroupBytes);
+            bbsc_own_world.erase(it);
+            ++groups;
+        }
+    }
+    u32 own = 0;
+    u32 was = 0;
+    const bool ok = PutBbscOwnChaliceBits(own, was);
+    if (ok) {
+        bbsc_own_world.erase(BbscOwnChaliceKey);
+    }
+    LOG_INFO(Debug,
+             "BBSC chalice: restore ({}) - {} of our own record groups back, 9020 {:#04x} (was "
+             "{:#04x}), read back {}",
+             why, groups, own, was, ok ? "ok" : "FAILED");
+    BBSC_TIMELINE("CHALICE", "restore ({}) - {} of our own record groups back, 9020 {:#04x} (was "
+                  "{:#04x}), read back {}",
+                  why, groups, own, was, ok ? "ok" : "FAILED");
+    bbsc_chalice_applied = {};
+    if (bbsc_own_world.empty()) {
+        bbsc_own_world_dirty = false;
+        if (bbsc_own_world_slot.has_value()) {
+            std::error_code ec;
+            const auto path = BbscOwnWorldPath(*bbsc_own_world_slot);
+            std::filesystem::rename(path, std::filesystem::path(path).concat(".restored"), ec);
+        }
+        bbsc_own_world_slot.reset();
+    } else {
+        bbsc_own_world_dirty = true;
+        WriteBbscOwnWorldFile();
+    }
+}
+
+// Guest side: the host's record into our live flags; false (with the reason) when it is not in and
+// read back. `force` writes again (a load can overwrite the flags, a changed record).
+bool ApplyBbscChaliceRecord(std::string_view why, bool force, std::string& refusal) {
+    BbscChaliceRecord host;
+    {
+        std::scoped_lock lock{bbsc_chalice_mutex};
+        host = bbsc_chalice_host;
+    }
+    if (host.received_ms == 0) {
+        refusal = "no record from the host";
+        return false;
+    }
+    if (SteadyNowMs() - host.received_ms > BbscChaliceFreshMs) {
+        refusal = "the host's record is older than 15 s";
+        return false;
+    }
+    if (host.slot > 6 || std::popcount(host.bits) != 1 || BbscChaliceSlotOf(host.bits) != host.slot) {
+        refusal = fmt::format("host slot {} (9020 {:#04x}) is not a dungeon slot", host.slot, host.bits);
+        return false;
+    }
+    std::array<u64, BbscChaliceGroups> storage{};
+    for (size_t i = 0; i < BbscChaliceGroups; ++i) {
+        storage[i] = BbscFlagGroupStorage(BbscChaliceKey(host.slot, i));
+    }
+    if (BbscFlagMan() == 0 || !BbscFlagFunctionsOk() || storage[0] == 0 || storage[1] == 0) {
+        refusal = "our flag table or the record groups are not available";
+        return false;
+    }
+    if (!force && bbsc_chalice_applied.active && bbsc_chalice_applied.key == host.key) {
+        // Already in: still in the live flags (a Dream restore can have taken them out)?
+        u32 live_bits = 0;
+        if (BbscReadFlagBits(BbscChaliceSlotFlag, BbscChaliceSlotBits, live_bits) &&
+            live_bits == host.bits &&
+            std::memcmp(reinterpret_cast<const void*>(storage[0]), host.groups[0].data(),
+                        BbscWorldGroupBytes) == 0 &&
+            std::memcmp(reinterpret_cast<const void*>(storage[1]), host.groups[1].data(),
+                        BbscWorldGroupBytes) == 0) {
+            return true;
+        }
+    }
+    // Our own copy first, once for each entry, and on disk before anything is overwritten.
+    for (size_t i = 0; i < BbscChaliceGroups; ++i) {
+        KeepBbscOwnWorldGroup(BbscChaliceKey(host.slot, i), reinterpret_cast<const u8*>(storage[i]));
+    }
+    if (!KeepBbscOwnChaliceBits()) {
+        refusal = "could not read our own 9020 bits";
+        return false;
+    }
+    WriteBbscOwnWorldFile();
+    if (bbsc_own_world_dirty) {
+        refusal = "our own copy is not on disk yet (no save slot known)";
+        return false;
+    }
+    for (size_t i = 0; i < BbscChaliceGroups; ++i) {
+        std::memcpy(reinterpret_cast<void*>(storage[i]), host.groups[i].data(), BbscWorldGroupBytes);
+    }
+    BbscWriteFlagBits(BbscChaliceSlotFlag, BbscChaliceSlotBits, host.bits);
+    u32 back = 0;
+    const bool read = BbscReadFlagBits(BbscChaliceSlotFlag, BbscChaliceSlotBits, back);
+    const bool groups_ok =
+        std::memcmp(reinterpret_cast<const void*>(storage[0]), host.groups[0].data(),
+                    BbscWorldGroupBytes) == 0 &&
+        std::memcmp(reinterpret_cast<const void*>(storage[1]), host.groups[1].data(),
+                    BbscWorldGroupBytes) == 0;
+    const u32 layout = BbscChaliceLiveLayout(host.slot);
+    if (!read || back != host.bits || BbscChaliceSlotOf(back) != host.slot || !groups_ok) {
+        refusal = fmt::format("9020 read back {:#04x}, wanted {:#04x} (groups {})", back, host.bits,
+                              groups_ok ? "ok" : "differ");
+        RestoreBbscChaliceOwn("write did not read back");
+        return false;
+    }
+    const bool first = !bbsc_chalice_applied.active || bbsc_chalice_applied.key != host.key;
+    bbsc_chalice_applied = {true, host.key, SteadyNowMs()};
+    if (first) {
+        LOG_INFO(Debug,
+                 "BBSC chalice: ({}) written/read back ok - slot {}, 9020 {:#04x}, layout id {:#x}, "
+                 "groups hash {:016x}, host sequence {}; our own copy is on disk",
+                 why, host.slot, back, layout, host.hash, host.sequence);
+        BBSC_TIMELINE("CHALICE", "({}) written/read back ok - slot {}, 9020 {:#04x}, layout id {:#x}, "
+                      "groups hash {:016x}",
+                      why, host.slot, back, layout, host.hash);
+    }
+    return true;
+}
+
+// Guest side, TickBbscFollowHost: true when the host's record is in our flags and verified.
+bool BbscChaliceFollowReady() {
+    std::string refusal;
+    if (ApplyBbscChaliceRecord("follow", false, refusal)) {
+        return true;
+    }
+    static std::string logged;
+    if (refusal != logged) {
+        logged = refusal;
+        LOG_WARNING(Debug, "BBSC chalice: not following - {}", refusal);
+        BBSC_TIMELINE("CHALICE", "not following - {}", refusal);
+    }
+    return false;
+}
+
+// Guest side: a record that changed (layout changes rewrite it) goes into the live flags without a
+// reload; our own record goes back once the dungeon is behind us.
+void TickBbscChaliceGuest() {
+    static s64 last_ms = 0;
+    if (!bbsc_chalice_applied.active) {
+        return;
+    }
+    const s64 now = SteadyNowMs();
+    if (now - last_ms < 1'000) {
+        return;
+    }
+    last_ms = now;
+    const u64 global = GetGlobalState();
+    if (!BbscGuestLootActive() || !ReadablePointer(global, 0x1598) ||
+        ReadValue<u8>(global, 0x08) != 0) {
+        return; // away from a host (the home restore does it), or a load is running
+    }
+    if (BbscMapArea(GetCurrentPackedMap()) == BbscChaliceArea) {
+        bool changed = false;
+        {
+            std::scoped_lock lock{bbsc_chalice_mutex};
+            changed = bbsc_chalice_host.key != bbsc_chalice_applied.key &&
+                      now - bbsc_chalice_host.received_ms < BbscChaliceFreshMs;
+        }
+        if (changed) {
+            std::string refusal;
+            if (!ApplyBbscChaliceRecord("record changed", true, refusal)) {
+                LOG_WARNING(Debug, "BBSC chalice: changed record not applied - {}", refusal);
+            }
+        }
+        return;
+    }
+    u32 host_map = 0;
+    s64 host_ms = 0;
+    {
+        std::scoped_lock lock{bbsc_follow_mutex};
+        host_map = bbsc_follow_latest.packed_map;
+        host_ms = bbsc_follow_latest.received_ms;
+    }
+    const bool host_in_dungeon =
+        BbscMapArea(host_map) == BbscChaliceArea && now - host_ms <= BbscFollowStaleMs;
+    if (!host_in_dungeon && now - bbsc_chalice_applied.applied_ms >= BbscChaliceLeaveMs) {
+        RestoreBbscChaliceOwn("out of the Chalice Dungeon");
+    }
+}
+
+// Chalice load setup, 0x01928680 entry (rsi+8 = the map). A Dream restore can have rewritten the
+// flags since the follow, so a guest writes the host's record again right before the load reads it.
+std::atomic<s64> bbsc_chalice_load_ms{0};
+void OnBbscChaliceLoad(const GuestRegisterSnapshot& registers) {
+    if (image_base == 0 || !ReadablePointer(registers.rsi, 0x0C) ||
+        (ReadValue<u32>(registers.rsi, 8) & 0xFF000000) != BbscChaliceLoadMap) {
+        return;
+    }
+    const u32 map = ReadValue<u32>(registers.rsi, 8);
+    bbsc_chalice_load_ms.store(SteadyNowMs());
+    const bool guest = BbscGuestLootActive();
+    std::string refusal;
+    if (guest && bbsc_chalice_applied.active && !ApplyBbscChaliceRecord("load", true, refusal)) {
+        LOG_WARNING(Debug, "BBSC chalice: load of map {:#x} - record not written again: {}", map,
+                    refusal);
+    }
+    u32 bits = 0;
+    BbscReadFlagBits(BbscChaliceSlotFlag, BbscChaliceSlotBits, bits);
+    const u32 slot = BbscChaliceSlotOf(bits);
+    const u32 layout = slot <= 6 ? BbscChaliceLiveLayout(slot) : 0;
+    static u64 logged = 0;
+    const u64 seen = (u64{map} << 32) ^ (u64{bits} << 24) ^ layout ^ (guest ? 1ull << 63 : 0);
+    if (seen != logged) {
+        logged = seen;
+        LOG_INFO(Debug, "BBSC chalice: {} load of map {:#x} - slot {}, 9020 {:#04x}, layout id {:#x}",
+                 guest ? "guest" : "host", map, slot, bits, layout);
+        BBSC_TIMELINE("CHALICE", "{} load of map {:#x} - slot {}, 9020 {:#04x}, layout id {:#x}",
+                      guest ? "guest" : "host", map, slot, bits, layout);
+    }
+}
+
+// Chalice loader, 0x01FF8D20 entry (rsi = the layout record; a first u32 of -1 returns at once).
+// Only the loads that follow a chalice load setup are logged.
+void OnBbscChaliceLoader(const GuestRegisterSnapshot& registers) {
+    const s64 since = bbsc_chalice_load_ms.load();
+    if (since == 0 || SteadyNowMs() - since > 30'000 || !ReadablePointer(registers.rsi, 0x58)) {
+        return;
+    }
+    const u32 first = ReadValue<u32>(registers.rsi, 0);
+    const u64 hash = BbscFnv1a(reinterpret_cast<const void*>(registers.rsi), 0x58);
+    static u64 logged = 0;
+    const u64 seen = hash ^ first;
+    if (seen != logged) {
+        logged = seen;
+        LOG_INFO(Debug, "BBSC chalice: loader first u32 {:#x}, hash of 0x58 bytes {:016x}", first, hash);
+        BBSC_TIMELINE("CHALICE", "loader first u32 {:#x}, hash of 0x58 bytes {:016x}", first, hash);
     }
 }
 
@@ -16588,6 +17145,12 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         RestoreBbscOwnWorldAtLoad();
         ApplyBbscSharedProgressAtLoad();
     }
+    if (site.offset == 0x01928680) {
+        OnBbscChaliceLoad(*registers);
+    }
+    if (site.offset == 0x01FF8D20) {
+        OnBbscChaliceLoader(*registers);
+    }
     if (site.offset == 0x01332C1B) { // SummonedPlacement.SelectMap: a load picks its map
         GuardBbscStrayForcedWarp(*registers);
     }
@@ -16625,6 +17188,8 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         TickBbscSpectate();
         TickBbscFollowBroadcast();
         TickBbscWorldFlagsBroadcast();
+        TickBbscChaliceBroadcast();
+        TickBbscChaliceGuest();
         TickBbscFollowHost();
         TickBbscLoadCover();
         TickBbscHpPenalty();
@@ -17439,6 +18004,10 @@ void OnBbscWorldFlagsPacket(const void* data, std::uint32_t size) {
     }
     SignalingBbscWorldFlags packet;
     std::memcpy(&packet, data, sizeof(packet));
+    if (packet.version == BbscChalicePacketVersion) {
+        OnBbscChaliceRecordPacket(packet);
+        return;
+    }
     // Version 1: the map block's groups; version 2: the host's Hunter's Dream state.
     const bool dream = packet.version == 2;
     const size_t group_total = dream ? BbscDreamGroupCount : BbscWorldGroupCount;
