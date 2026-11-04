@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-11-04 - Chalice Dungeon co-op: joining a host that is already inside, empty stub loads
+
+- A guest who joins while the host is already inside gets the record after the first load, which
+  built no dungeon (grey screen). It now reloads once into the dungeon when the record is in. If the
+  summon load finds the host's record already here, the record is written before that load and no
+  reload is needed.
+- The join keeps the load cover up through that reload (no world shown between the two loads).
+- A player who loads alone into an empty Chalice stub (a crash as a guest left the save there) is sent
+  to the spot they joined from (the Hunter's Dream when that is not known), after their own record is
+  back. The spot is kept in the own-world journal for that. At most two trips.
+- Lines start "BBSC chalice:".
+
 ## 2026-11-04 - Chalice Dungeon co-op: a guest follows the host in
 
 - Area 29 has one map id for every Chalice Dungeon, so the packet that tells a guest where the host is

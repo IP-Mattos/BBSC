@@ -359,6 +359,8 @@ constexpr auto Sites = std::to_array<TraceSite>({
     {"BBSC.Items.NumberKind1", 0x017D4C40, TraceKind::MatchingLeaveDecision, StandardR15Prologue, 6},
     // Chalice Dungeon load setup (rsi+8 = the map; area 29 reads the dungeon slot from flags 9020..).
     {"BBSC.Chalice.Load", 0x01928680, TraceKind::MatchingLeaveDecision, StandardR15Prologue, 6},
+    // The Chalice loader (rsi = the layout record, first u32 -1 returns at once).
+    {"BBSC.Chalice.Loader", 0x01FF8D20, TraceKind::MatchingLeaveDecision, StandardR15Prologue, 6},
     {"CSRequestSummon.Init", 0x014B47C0, TraceKind::SummonRequest, StandardR15Prologue, 6},
     {"CSRequestSummon.Update", 0x014B4890, TraceKind::SummonRequest, StandardRbxPrologue, 5},
     {"CSRequestSummon.CheckWait", 0x014B48C0, TraceKind::SummonRequest, StandardR15Prologue, 6},
@@ -3287,6 +3289,7 @@ void WriteEnginePanicStack(std::ostream& out, const GuestRegisterSnapshot& regis
 // The guest's loads under the death curtain's fade, see "Load cover".
 void StartBbscLoadCover(std::string_view why);
 void EndBbscLoadCover(std::string_view how);
+bool BbscChaliceHoldsLoadCover(); // the join load built no Chalice dungeon: the reload follows
 // The host's world state for a follow load, see "World state when warping together".
 bool BbscHostWorldFlagsReady(u32 packed_map);
 bool ApplyBbscHostWorldFlags(u32 packed_map, std::string_view why);
@@ -3296,6 +3299,8 @@ void KeepBbscOwnWorldGroup(u32 key, const u8* live); // see "Own world journal"
 void KeepBbscOwnTimeBits();                           // see "Time of night in the host's world"
 void ApplyBbscHostTime(std::string_view why);
 void KeepBbscHomeSpot();                              // see "Back home where we were"
+void NoteBbscRecoveredHomeSpot(const u8* bytes);      // the journal's copy of it, after a crash
+void KeepBbscHomeSpotInJournal();
 void CaptureBbscOwnWorldBeforeJoin();
 void WriteBbscOwnWorldFile();
 void NoteBbscOwnDreamRestored(u32 key, const u8* live);
@@ -3327,6 +3332,7 @@ void WriteLuaSessionEvent(std::ostream& out, const GuestRegisterSnapshot& regist
     }
     if (name == "JoinSession_White" && GetSessionState() != 3) {
         CaptureBbscOwnWorldBeforeJoin(); // first: the load resets the map's item flags
+        KeepBbscHomeSpotInJournal();
         StartBbscLoadCover("summon");
     }
     if (name == "OnLeaveMagic" || name == "OnLeaveMenu_Yes") {
@@ -4681,6 +4687,13 @@ void TickBbscJoinTeleport() {
              "({:.2f}, {:.2f}, {:.2f})",
              own ? own->position[0] : 0.0f, own ? own->position[1] : 0.0f,
              own ? own->position[2] : 0.0f, position[0], position[1], position[2]);
+    if (BbscChaliceHoldsLoadCover()) {
+        // No world between the two loads: the cover stays up for the Chalice reload that follows.
+        LOG_INFO(Debug, "BBSC load cover: kept up after the join teleport - the join load built no "
+                        "Chalice dungeon and the reload follows");
+        BBSC_TIMELINE("LOAD", "load cover: kept up through the Chalice reload");
+        return;
+    }
     EndBbscLoadCover("guest placed beside the host");
 }
 
@@ -4749,6 +4762,9 @@ void ApplyBbscHostDreamState(std::string_view why);
 void RestoreBbscOwnDreamState(std::string_view why);
 // The host's Chalice Dungeon record is in our flags and read back, see "Chalice Dungeon record".
 bool BbscChaliceFollowReady();
+bool BbscChaliceStubReloadWanted(bool settled); // a join load that found no dungeon, record now in
+void NoteBbscChaliceStubReload();
+void ResetBbscChaliceStubReload();
 constexpr u32 BbscChaliceLoadMap = 0x1D000000;
 
 // Host side: say where we are, so a guest that is somewhere else can come to us.
@@ -4893,6 +4909,7 @@ void TickBbscFollowHost() {
     static u32 target_map = 0;
     static u32 attempts_map = 0;
     static int attempts = 0;
+    static bool stub_reload_pending = false; // the Chalice reload asked for, its load not seen yet
     if (!BbscWarpTogetherEnabled() || image_base == 0) {
         return;
     }
@@ -4906,6 +4923,8 @@ void TickBbscFollowHost() {
     if (GetSessionState() != 6 || !ReadablePointer(global, 0x1598) ||
         ReadValue<u8>(global, 0x1592) != 0 || GetLocalPlayerType() == 2) {
         warping = false;
+        stub_reload_pending = false;
+        ResetBbscChaliceStubReload();
         target_map = 0;
         return; // not a co-op guest in someone else's world (an invader does not follow)
     }
@@ -4931,6 +4950,7 @@ void TickBbscFollowHost() {
     // Area 29 is one map id for every Chalice Dungeon and the packet has no dungeon id: the guest
     // follows only with the host's dungeon record in its flags (see "Chalice Dungeon record").
     static bool chalice_told = false;
+    bool stub_reload = false;
     if ((host.packed_map >> 24) == 29) {
         if (!warping && !BbscChaliceFollowReady()) {
             if (!chalice_told) {
@@ -4944,12 +4964,29 @@ void TickBbscFollowHost() {
             return;
         }
         chalice_told = false;
+        // Joined while the host was inside: that load had no record and built no dungeon (layout id
+        // -1, grey screen), and the record only arrives afterwards. One reload, now it is in.
+        stub_reload = !warping && BbscChaliceStubReloadWanted(now - last_load_ms >= 1'500);
         host.packed_map = BbscChaliceLoadMap; // the load forces this map whatever the host's id
     } else {
         chalice_told = false;
     }
 
     if (warping) {
+        if (stub_reload_pending) {
+            // We already stand in the target map: wait until the reload has actually run.
+            if (last_load_ms < warp_requested_ms) {
+                if (now - warp_requested_ms > BbscFollowArriveTimeoutMs) {
+                    warping = false;
+                    stub_reload_pending = false;
+                    LOG_WARNING(Debug, "BBSC chalice: the reload never started after {} s",
+                                BbscFollowArriveTimeoutMs / 1000);
+                    EndBbscLoadCover("chalice reload did not start");
+                }
+                return;
+            }
+            stub_reload_pending = false;
+        }
         if (GetCurrentPackedMap() != target_map) {
             if (now - warp_requested_ms > BbscFollowArriveTimeoutMs) {
                 // Never waiting forever again (code review A3): the load went somewhere else.
@@ -5020,7 +5057,7 @@ void TickBbscFollowHost() {
     // The host's map when both were last in the same one: a different map later means the HOST
     // went somewhere. If only the guest walked off, the host's map is still this one.
     static u32 shared_host_map = 0;
-    if (!IsUsablePackedMap(here) || here == host.packed_map) {
+    if (!stub_reload && (!IsUsablePackedMap(here) || here == host.packed_map)) {
         mismatch_since_ms = 0;
         shared_host_map = host.packed_map;
         return; // same map as the host: nothing to follow
@@ -5039,7 +5076,7 @@ void TickBbscFollowHost() {
     // host who changed map since they last shared one.
     const bool host_moved = shared_host_map != 0 && host.packed_map != shared_host_map;
     const bool same_area = (here >> 24) == (host.packed_map >> 24);
-    if (!host_loaded_there && (same_area || !host_moved)) {
+    if (!host_loaded_there && !stub_reload && (same_area || !host_moved)) {
         static u32 apart_logged = 0;
         if (apart_logged != (here ^ host.packed_map)) {
             apart_logged = here ^ host.packed_map;
@@ -5051,7 +5088,7 @@ void TickBbscFollowHost() {
         mismatch_since_ms = 0;
         return;
     }
-    if (!host_loaded_there && BbscMapResident(host.packed_map)) {
+    if (!host_loaded_there && !stub_reload && BbscMapResident(host.packed_map)) {
         static u32 walk_logged = 0;
         if (walk_logged != host.packed_map) {
             walk_logged = host.packed_map;
@@ -5068,17 +5105,17 @@ void TickBbscFollowHost() {
     if (mismatch_since_ms == 0) {
         mismatch_since_ms = now;
     }
-    if (now - mismatch_since_ms < BbscFollowMismatchMs) {
+    if (now - mismatch_since_ms < BbscFollowMismatchMs && !stub_reload) {
         return;
     }
-    if (!settled || GetCharacterHp(GetLocalPlayerCharacter()) <= 0) {
+    if ((!settled && !stub_reload) || GetCharacterHp(GetLocalPlayerCharacter()) <= 0) {
         return; // just out of a load, or dead: the follow waits (the wipe/respawn logic owns this)
     }
     if (attempts_map != host.packed_map) {
         attempts_map = host.packed_map;
         attempts = 0;
     }
-    if (attempts >= BbscFollowMaxAttempts) {
+    if (attempts >= BbscFollowMaxAttempts && !stub_reload) { // the Chalice reload is counted apart
         return; // gave up on this map; a new host map starts a fresh count
     }
     // Load the host's world, not our own: its flags for that map first (sent every second).
@@ -5141,6 +5178,10 @@ void TickBbscFollowHost() {
     warping = true;
     target_map = host.packed_map;
     warp_requested_ms = now;
+    if (stub_reload) {
+        stub_reload_pending = true;
+        NoteBbscChaliceStubReload();
+    }
     ArmBbscRejoinLines(true, host.packed_map, BbscFollowArriveTimeoutMs);
 }
 
@@ -6069,6 +6110,7 @@ constexpr u8 BbscTimeMask = 0xE0;
 constexpr u32 BbscOwnTimeKey = 0xFFFF9800;
 // Pseudo group: byte 0 = our 9020 bits, byte 1 = 1 when kept.
 constexpr u32 BbscOwnChaliceKey = 0xFFFF9020;
+constexpr u32 BbscOwnHomeKey = 0xFFFF0A0E; // pseudo group: the spot we joined from (BbscHomeSpot)
 constexpr s64 BbscHostTimeFreshMs = 120'000;
 // Guest: the host's night from its last progress packet (-1 = not known yet).
 std::atomic<s32> bbsc_host_time_bits{-1};
@@ -6337,7 +6379,7 @@ size_t RestoreBbscOwnWorld(std::string_view why) {
     size_t bits = 0;
     size_t missing = 0;
     for (const auto& [key, own] : bbsc_own_world) {
-        if (key == BbscOwnTimeKey || key == BbscOwnChaliceKey) {
+        if (key == BbscOwnTimeKey || key == BbscOwnChaliceKey || key == BbscOwnHomeKey) {
             continue; // our own night and Chalice bits: put back below, after every real group
         }
         const u64 storage = BbscFlagGroupStorage(key);
@@ -6387,6 +6429,10 @@ size_t RestoreBbscOwnWorld(std::string_view why) {
         }
     }
     RestoreBbscOwnChaliceBits(why);
+    if (const auto home = bbsc_own_world.find(BbscOwnHomeKey);
+        home != bbsc_own_world.end() && why == "after a crash") {
+        NoteBbscRecoveredHomeSpot(home->second.data()); // the trip home of a stub load needs it
+    }
     bbsc_own_world.clear();
     bbsc_own_world_dirty = false;
     if (bbsc_own_world_slot.has_value()) {
@@ -7042,14 +7088,39 @@ void TickBbscChaliceGuest() {
 
 // Chalice load setup, 0x01928680 entry (rsi+8 = the map). A Dream restore can have rewritten the
 // flags since the follow, so a guest writes the host's record again right before the load reads it.
+std::atomic<s64> bbsc_chalice_load_ms{0};
+// What the loader (0x01FF8D20) saw in the newest chalice load: 0 nothing yet, 1 layout id -1 (no
+// dungeon built), 2 a real layout id.
+std::atomic<int> bbsc_chalice_layout_state{0};
+// A guest's join load built no dungeon: the load cover is kept up until the reload (0 = no hold).
+std::atomic<s64> bbsc_chalice_hold_ms{0};
+constexpr s64 BbscChaliceHoldMs = 20'000;
+u64 bbsc_chalice_stub_reloaded_key = 0; // record the one allowed reload was spent on
 void OnBbscChaliceLoad(const GuestRegisterSnapshot& registers) {
     if (image_base == 0 || !ReadablePointer(registers.rsi, 0x0C) ||
         (ReadValue<u32>(registers.rsi, 8) & 0xFF000000) != BbscChaliceLoadMap) {
         return;
     }
     const u32 map = ReadValue<u32>(registers.rsi, 8);
+    bbsc_chalice_load_ms.store(SteadyNowMs());
+    bbsc_chalice_layout_state.store(0);
     const bool guest = BbscGuestLootActive();
     std::string refusal;
+    // A summoned guest whose host record is already here (it comes with the host's first packets)
+    // writes it before this load reads it: the dungeon is built at once and no reload is needed.
+    const s32 session = GetSessionState();
+    bool record_here = false;
+    {
+        std::scoped_lock lock{bbsc_chalice_mutex};
+        record_here = bbsc_chalice_host.received_ms != 0 &&
+                      SteadyNowMs() - bbsc_chalice_host.received_ms <= BbscChaliceFreshMs;
+    }
+    if (!guest && (session == 4 || session == 6) && !bbsc_chalice_applied.active && record_here &&
+        !ApplyBbscChaliceRecord("summon load", true, refusal)) {
+        LOG_WARNING(Debug, "BBSC chalice: summon load of map {:#x} - the host's record is not in "
+                           "yet: {}",
+                    map, refusal);
+    }
     if (guest && bbsc_chalice_applied.active && !ApplyBbscChaliceRecord("load", true, refusal)) {
         // Never load on a mix of the host's record and our bits: ours whole, as before the follow.
         LOG_WARNING(Debug, "BBSC chalice: load of map {:#x} - record not written again ({}), our own "
@@ -7070,6 +7141,93 @@ void OnBbscChaliceLoad(const GuestRegisterSnapshot& registers) {
         BBSC_TIMELINE("CHALICE", "{} load of map {:#x} - slot {}, 9020 {:#04x}, layout id {:#x}",
                       guest ? "guest" : "host", map, slot, bits, layout);
     }
+}
+
+// Chalice loader, 0x01FF8D20 entry (rsi = the layout record; a first u32 of -1 returns at once).
+// Only the loads that follow a chalice load setup are logged.
+void OnBbscChaliceLoader(const GuestRegisterSnapshot& registers) {
+    const s64 since = bbsc_chalice_load_ms.load();
+    if (since == 0 || SteadyNowMs() - since > 30'000 || !ReadablePointer(registers.rsi, 0x58)) {
+        return;
+    }
+    const u32 first = ReadValue<u32>(registers.rsi, 0);
+    if (first != 0xFFFFFFFF) {
+        bbsc_chalice_layout_state.store(2); // a real layout wins over any empty call of the load
+        bbsc_chalice_hold_ms.store(0);
+    } else {
+        int none = 0;
+        if (bbsc_chalice_layout_state.compare_exchange_strong(none, 1) &&
+            (GetSessionState() == 4 || GetSessionState() == 6)) {
+            bbsc_chalice_hold_ms.store(SteadyNowMs()); // a summoned guest: hold the load cover
+            LOG_INFO(Debug, "BBSC load cover: the guest's load built no Chalice dungeon - held "
+                            "through the record write and the reload (at most {} s)",
+                     BbscChaliceHoldMs / 1000);
+        }
+    }
+    const u64 hash = BbscFnv1a(reinterpret_cast<const void*>(registers.rsi), 0x58);
+    static u64 logged = 0;
+    const u64 seen = hash ^ first;
+    if (seen != logged) {
+        logged = seen;
+        LOG_INFO(Debug, "BBSC chalice: loader first u32 {:#x}, hash of 0x58 bytes {:016x}", first, hash);
+        BBSC_TIMELINE("CHALICE", "loader first u32 {:#x}, hash of 0x58 bytes {:016x}", first, hash);
+    }
+}
+
+// Game thread. True once per record: we stand in area 29 after a load that built no dungeon and the
+// host's record is in our flags and read back. Not for a host, a solo player or a load with a layout.
+bool BbscChaliceStubReloadWanted(bool settled) {
+    // The stub load can leave the map list empty (map 0), so 0 counts too, but only in a stub state.
+    const u32 here = GetCurrentPackedMap();
+    if (bbsc_chalice_layout_state.load() != 1 || !settled || !bbsc_chalice_applied.active ||
+        (here != 0 && BbscMapArea(here) != BbscChaliceArea)) {
+        return false;
+    }
+    if (bbsc_chalice_stub_reloaded_key == bbsc_chalice_applied.key) {
+        static u64 logged = 0;
+        if (logged != bbsc_chalice_applied.key) {
+            logged = bbsc_chalice_applied.key;
+            LOG_WARNING(Debug, "BBSC chalice: the load after the reload built no dungeon either "
+                               "(layout id -1); not reloading again, the guest stays where it is");
+            BBSC_TIMELINE("CHALICE", "the load after the reload built no dungeon either; not "
+                                     "reloading again");
+        }
+        return false;
+    }
+    return true;
+}
+
+// True while the cover is to stay up for the reload; false (and the hold gone) once the dungeon
+// turned out real, the time is up, or the reload has been asked for (its own arrival ends the cover).
+bool BbscChaliceHoldsLoadCover() {
+    const s64 since = bbsc_chalice_hold_ms.load();
+    if (since == 0) {
+        return false;
+    }
+    if (bbsc_chalice_layout_state.load() == 2 || SteadyNowMs() - since > BbscChaliceHoldMs) {
+        bbsc_chalice_hold_ms.store(0);
+        LOG_WARNING(Debug, "BBSC load cover: hold for the Chalice reload lifted ({})",
+                    bbsc_chalice_layout_state.load() == 2 ? "a real dungeon loaded"
+                                                          : "the reload did not start in time");
+        return false;
+    }
+    return true;
+}
+
+void NoteBbscChaliceStubReload() {
+    bbsc_chalice_hold_ms.store(0); // the reload's arrival ends the cover from here
+    bbsc_chalice_stub_reloaded_key = bbsc_chalice_applied.key;
+    bbsc_chalice_layout_state.store(0);
+    LOG_INFO(Debug, "BBSC chalice: reload into {:#x} requested - the join load built no dungeon "
+                    "(layout id -1) and the host's record (slot 9020 {:#04x}) is in place and "
+                    "read back",
+             BbscChaliceLoadMap, bbsc_chalice_applied.bits);
+    BBSC_TIMELINE("CHALICE", "reload into {:#x} requested - the join load built no dungeon",
+                  BbscChaliceLoadMap);
+}
+
+void ResetBbscChaliceStubReload() {
+    bbsc_chalice_stub_reloaded_key = 0; // the layout state stays: a solo stub load still needs it
 }
 
 // Quit to title: another character can be loaded next, so the journal goes to its file and leaves
@@ -7850,6 +8008,12 @@ void TickBbscLoadCover() {
     const s64 now = SteadyNowMs();
     if (now - bbsc_load_cover.started_ms > BbscLoadCoverLimitMs) {
         EndBbscLoadCover("time limit");
+        return;
+    }
+    // Held for a Chalice reload that never came (refused, record missing, time up): lift it.
+    if (bbsc_chalice_hold_ms.load() != 0 && !BbscChaliceHoldsLoadCover() &&
+        bbsc_join_teleport_done) {
+        EndBbscLoadCover("Chalice hold lifted");
         return;
     }
     const s32 session_state = GetSessionState();
@@ -9690,6 +9854,39 @@ void KeepBbscHomeSpot() {
     BBSC_TIMELINE("HOME", "kept our spot in {} for the trip home", BbscAreaName(map));
 }
 
+// Into the own world journal (file included), after the join capture: after a crash the spot of
+// the trip home is still known.
+void KeepBbscHomeSpotInJournal() {
+    if (!bbsc_home_spot.valid) {
+        return;
+    }
+    std::array<u8, BbscWorldGroupBytes> packed{};
+    std::memcpy(packed.data(), &bbsc_home_spot.map, 4);
+    std::memcpy(packed.data() + 4, bbsc_home_spot.position.data(), 16);
+    std::memcpy(packed.data() + 20, bbsc_home_spot.rotation.data(), 16);
+    packed[36] = 1;
+    bbsc_own_world[BbscOwnHomeKey] = packed;
+    bbsc_own_world_dirty = true;
+    WriteBbscOwnWorldFile();
+}
+
+void NoteBbscRecoveredHomeSpot(const u8* bytes) {
+    if (bytes[36] != 1 || bbsc_home_spot.valid) {
+        return;
+    }
+    std::memcpy(&bbsc_home_spot.map, bytes, 4);
+    std::memcpy(bbsc_home_spot.position.data(), bytes + 4, 16);
+    std::memcpy(bbsc_home_spot.rotation.data(), bytes + 20, 16);
+    bbsc_home_spot.valid = true;
+    bbsc_home_spot.left = true; // we were away when the game closed
+    LOG_INFO(Debug, "BBSC return home: the spot {:#x} we joined from was kept by an earlier run",
+             bbsc_home_spot.map);
+}
+
+// A trip home that BBSC asks for in our own world (an empty Chalice load): the map choice would take
+// the forced warp off as "not a guest", so it leaves it alone until this time.
+s64 bbsc_forced_home_until_ms = 0;
+
 // Game tick: forget the spot once we are home again after having been away.
 void TickBbscHomeSpot() {
     if (!bbsc_home_spot.valid) {
@@ -9750,7 +9947,7 @@ void GuardBbscStrayForcedWarp(const GuestRegisterSnapshot& registers) {
     const u32 forced_map = ReadValue<u32>(global, 0x14F0);
     // Mod 24 only cleared it when +0x14F0 held no map; 22:17:12 it held the host's own map and the
     // host still fell (the position is the summon placement's, not his). Not a guest = no forced warp.
-    const bool clear = BbscOwnWorldNonGuest(global);
+    const bool clear = BbscOwnWorldNonGuest(global) && SteadyNowMs() >= bbsc_forced_home_until_ms;
     if (clear) {
         WriteValue<u8>(global, 0x1520, 0);
     } else if (ReadValue<u8>(global, 0x1592) == 0 && GetSessionState() != 4 &&
@@ -9775,7 +9972,7 @@ void TickBbscStrayForcedWarp() {
     last_ms = now;
     const u64 global = GetGlobalState();
     if (!BbscOwnWorldNonGuest(global) || ReadValue<u8>(global, 0x08) != 0 ||
-        ReadValue<u8>(global, 0x1520) == 0) {
+        ReadValue<u8>(global, 0x1520) == 0 || now < bbsc_forced_home_until_ms) {
         since_ms = 0;
         return;
     }
@@ -10108,6 +10305,24 @@ void TickBbscStuckLeaveLocks() {
 // 0x01385930): event state 2, forced warp global+0x1520 = 1, home respawn point 0x01332BC0(-1),
 // StageTransition 0x013CDE30.
 constexpr s64 BbscStrandedMs = 15'000;
+
+// The Lua and event state the trip home needs are there.
+bool BbscTripHomeReady(u64& lua, u64& event_state) {
+    const u64 lua_man = ReadValue<u64>(image_base + 0x0553B0C8, 0);
+    lua = ReadablePointer(lua_man, 0x10) ? ReadValue<u64>(lua_man, 8) : 0;
+    event_state = ReadValue<u64>(image_base + 0x0553B0D8, 0);
+    return lua != 0 && ReadablePointer(event_state, 4) && IsSprjLuaEventManReady();
+}
+
+void BbscTripHome(u64 global, u64 lua, u64 event_state, bool forced = true) {
+    WriteValue<s32>(event_state, 0, 2);
+    WriteValue<u8>(global, 0x1520, forced ? 1 : 0); // 0: the respawn select takes the last lamp
+    using HomePoint = void PS4_SYSV_ABI (*)(u64 lua, s32 point);
+    using Transition = u64 PS4_SYSV_ABI (*)();
+    reinterpret_cast<HomePoint>(image_base + 0x01332BC0)(lua, -1);
+    reinterpret_cast<Transition>(image_base + 0x013CDE30)();
+}
+
 void TickBbscStrandedGuest() {
     static s64 since_ms = 0;
     static s64 last_ms = 0;
@@ -10151,6 +10366,114 @@ void TickBbscStrandedGuest() {
     using Transition = u64 PS4_SYSV_ABI (*)();
     reinterpret_cast<HomePoint>(image_base + 0x01332BC0)(lua, -1);
     reinterpret_cast<Transition>(image_base + 0x013CDE30)();
+}
+
+// Solo in our own world and loaded into an empty Chalice stub (layout id -1: grey screen, falling),
+// e.g. after a crash as a guest in the host's dungeon left the save there. Away within seconds: the
+// journal is recovered at once when the save slot is known (it gives the spot we joined from and our
+// own record), else the trip goes to the Hunter's Dream first and the usual recovery follows. The
+// trip does not read the Chalice record, so the order does not matter for it.
+void TickBbscChaliceStubHome() {
+    static s64 last_ms = 0;
+    static s64 handled_load_ms = 0;
+    static s64 recover_tried_load_ms = 0;
+    static s64 logged_load_ms = 0;
+    static std::string logged_reasons;
+    static int sent = 0;
+    const s64 now = SteadyNowMs();
+    if (image_base == 0 || now - last_ms < 500) {
+        return;
+    }
+    last_ms = now;
+    const u64 global = GetGlobalState();
+    const s64 load_ms = bbsc_chalice_load_ms.load();
+    if (bbsc_chalice_layout_state.load() != 1 || load_ms == handled_load_ms) {
+        return;
+    }
+    // Once per reason and load: what the trip is waiting for.
+    const auto wait = [&](std::string_view reason) {
+        if (logged_load_ms != load_ms) {
+            logged_load_ms = load_ms;
+            logged_reasons.clear();
+            LOG_INFO(Debug, "BBSC chalice: the load of map 0x1d000000 built no dungeon (layout id "
+                            "-1) - own world, session state {}", GetSessionState());
+        }
+        if (logged_reasons.find(reason) == std::string::npos) {
+            logged_reasons += reason;
+            logged_reasons += ';';
+            LOG_INFO(Debug, "BBSC chalice: the trip home waits - {}", reason);
+        }
+    };
+    if (!BbscOwnWorldNonGuest(global) || GetSessionState() != 0) {
+        return; // a guest (its own reload) or not our own world
+    }
+    if (ReadValue<u8>(global, 0x08) != 0) {
+        // A load that began after the chalice one means the state is old (the stub is gone).
+        if (now - load_ms > 10'000) {
+            bbsc_chalice_layout_state.store(0);
+        }
+        wait("a load is running");
+        return;
+    }
+    const u64 me = GetLocalPlayerCharacter();
+    if (now - load_ms < 3'000) {
+        wait("the load is settling");
+        return;
+    }
+    if (me == 0) {
+        wait("no character yet");
+        return;
+    }
+    // Journal first when the save slot allows it (character checks stay in RecoverBbscOwnWorldFile).
+    if (bbsc_own_world.empty() && recover_tried_load_ms != load_ms) {
+        recover_tried_load_ms = load_ms;
+        if (const auto slot = BbscActiveSaveSlot(); slot.has_value()) {
+            if (!RecoverBbscOwnWorldFile(*slot)) {
+                wait("no journal to recover, or the save slot gate refused it");
+            }
+        } else {
+            wait("no save slot known yet, so no journal recovery before the trip");
+        }
+    }
+    const bool have_home = bbsc_home_spot.valid && bbsc_home_spot.left &&
+                           BbscMapArea(bbsc_home_spot.map) != BbscChaliceArea;
+    u64 lua = 0;
+    u64 event_state = 0;
+    if (!BbscTripHomeReady(lua, event_state)) {
+        wait("the Lua and event state are not ready");
+        return;
+    }
+    handled_load_ms = load_ms;
+    if (sent >= 2) {
+        LOG_WARNING(Debug, "BBSC chalice: the load built no dungeon again after {} trip(s) home; "
+                           "not sending home again",
+                    sent);
+        return;
+    }
+    ++sent;
+    const u32 here = GetCurrentPackedMap();
+    const u32 target = have_home ? bbsc_home_spot.map : BbscDreamStateMap;
+    LOG_WARNING(Debug,
+                "BBSC chalice: our own load of map {:#x} built no dungeon (layout id -1) - sending "
+                "us {} {:#x} ({}){}",
+                here, have_home ? "home to" : "to the Hunter's Dream, no spot to go home to is known:",
+                target, BbscAreaName(target), GetCharacterHp(me) <= 0 ? ", dead" : "");
+    BBSC_TIMELINE("CHALICE", "own load built no dungeon - sending us to {}", BbscAreaName(target));
+    if (GetCharacterHp(me) <= 0) {
+        ReleaseBbscLeaveLocks("dead in an empty Chalice load");
+    }
+    bbsc_chalice_layout_state.store(0);
+    if (have_home) {
+        PutBbscHomeSpot(global);
+        bbsc_forced_home_until_ms = now + 30'000;
+        BbscTripHome(global, lua, event_state);
+        return;
+    }
+    // The Dream's lamp as the last lamp (point 2102961 = area 21 block 0, aux 101200, as the captures
+    // read it from global+0x1528): the respawn select takes it, and so does any later death or load,
+    // instead of the Chalice. The landing there has not been checked.
+    WriteValue<s64>(global, 0x1528, (s64{101'200} << 32) | 2'102'961);
+    BbscTripHome(global, lua, event_state, false);
 }
 
 // Shop trace (2026-10-07). Report: in the host's Dream the Bath Messenger sold the guest everything
@@ -17100,6 +17423,9 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
     if (site.offset == 0x01928680) {
         OnBbscChaliceLoad(*registers);
     }
+    if (site.offset == 0x01FF8D20) {
+        OnBbscChaliceLoader(*registers);
+    }
     if (site.offset == 0x01332C1B) { // SummonedPlacement.SelectMap: a load picks its map
         GuardBbscStrayForcedWarp(*registers);
     }
@@ -17128,6 +17454,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         TickBbscLeaveLocks();
         TickBbscStuckLeaveLocks();
         TickBbscStrandedGuest();
+        TickBbscChaliceStubHome();
         TickBbscBossLine();
         TickBbscProgressBroadcast();
         TickBbscOwnWorld();
