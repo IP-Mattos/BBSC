@@ -15,8 +15,8 @@ $PortUrl = "https://github.com/Supermedo/bloodborne_pc/releases/download/windows
 $PortSha = "b3444c6a4d201e75f2b3ea80f2f4663bfa8e78eda7652054819ba8622cc7a759"
 $KitUrl = "https://github.com/IP-Mattos/BBSC/releases/download/v0.0.2-bbport197-test2/BBSC-0.0.2-BBport-1.9.7-coop-test2.zip"
 $KitSha = "35a2cc7c09a9df5e67e32f451714a4f692dc4bfb133602f175e33823f5a4fd86"
-$DllUrl = "https://github.com/IP-Mattos/BBSC/releases/download/v0.0.2-bbport197-test5/bbsc.dll"
-$DllSha = "c21bc1efb8e958ce69a6370d6ce39009f290a79000ba729b63ce2f1d8d45149b"
+$DllUrl = "https://github.com/IP-Mattos/BBSC/releases/download/v0.0.2-bbport197-test6/bbsc.dll"
+$DllSha = "d06b1afe1b2e9da54101c091deed18287f1119f64cad651296db17eeacb5b652"
 $PortVersion = "1.9.7"
 $NeededFreeGb = 2
 
