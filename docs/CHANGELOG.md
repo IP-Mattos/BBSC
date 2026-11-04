@@ -9,6 +9,8 @@ Tested in game with two players:
 - Guest can use the altar and workbench in the host's Dream.
 
 Not tested in game:
+- The second reload after a cross-map join (SHADPS4_BBSC_WARP_JOIN) is off by default. It was added for flickering lights after one load, so
+  watch for that. Set the flag to get it back.
 - A guest follows a host into a Chalice Dungeon with the host's dungeon: area 29 has one map id for every dungeon, so the
   host sends flag groups 94000+100*slot and 94001+100*slot plus the 9020 bits (SignalingBbscWorldFlags version 3, at once
   when they change, otherwise every 5 s). The guest keeps its own copy in own-world/ (file), writes them, reads 9020 back
@@ -32,9 +34,8 @@ Not tested in game:
 - Banner when a host rang the sign but the join failed.
 - Banner when the host may run another BBSC. Relay frame "SHAD" 0x28 + u8 BbscProtocolLevel; raise the level when
   packets change. Stock players ignore the frame, so a compatible stock host also shows the banner.
-- Workshop checks are found in one memory walk (FindAnyInMemory), retried every 20 s up to 4 times per Dream visit.
-- Workshop checks: the memory walk does less work per step, and the 64 MB blocks that held a site are searched first on the next
-  scan, so repeat visits open at once; the first visit still waits for the walk (126 s before; log "workshop tool scan took N ms").
+- Workshop checks: no memory scan any more. A hook at 0x0203EE48 (case 47 of the talk condition dispatcher, the item count
+  check) makes the guest's count of items 4102-4104 read 1 in the host's Dream, so the altar and workbench work at once.
 - Enemy drops for a guest (SHADPS4_BBSC_GUEST_ITEMS): goods that do not fit the carried items go to the storage box, and a
   partial fit sends the rest there (log: "put into the storage box", "no room" with both fit answers). Weapons, blood gems
   and attire are kept in guest-items/owed-drops-<user>-<slot>.txt and awarded at home, one every 10 s, by the game's award

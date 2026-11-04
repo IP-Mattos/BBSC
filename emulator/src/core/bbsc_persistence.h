@@ -31,7 +31,6 @@ inline constexpr std::array<std::string_view, 35> DefaultOnSwitches{
     "SHADPS4_BBSC_NO_FOG_WALLS",         // co-op area fog walls hidden, leaving the area allowed
     "SHADPS4_BBSC_MESSAGES",             // co-op texts that fit seamless play (no "Returning to your world")
     "SHADPS4_BBSC_CONNECT_FIRST",        // cross-map summon: join first, one load into host map
-    "SHADPS4_BBSC_WARP_JOIN",            // after a cross-map join, one more real reload (lighting)
     "SHADPS4_BLOODBORNE_SEAMLESS_COOP",  // Wozzardman's seamless summon
     "SHADPS4_BLOODBORNE_RE_TRACE",       // installs the BBSC hooks (and the trace logs)
     "SHADPS4_CAPTURE_BLOODBORNE_SUMMON", // summon capture files for collect-logs
