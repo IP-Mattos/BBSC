@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-11-04 - Key items a guest took in a host's world are put back at home
+
+- Goods passed to the game's give (0x017D89F0) and its window (0x016D8850) while a guest are listed in
+  item-ledger/owed-<user>-<slot>.txt: keys 4000-4021 except 4014 and 4017, workshop tools 4102-4105,
+  hunter badges 4110-4120, messenger ribbons 4903-4908 and chalices 6100-6539. At home, one that did
+  not survive the trip is added again and a notice says so. Off with SHADPS4_BBSC_ITEM_LEDGER=0.
+  The list of items comes from mark3317/BBSC-GL.
+
 ## 2026-10-04 (c) - mod 11: Silencing Blank ends the co-op cleanly; Memory Altar for the guest
 
 - New tool: tools\gamedata\lua50.py - reads the game's compiled Lua (Lua 5.0 with one extra empty list

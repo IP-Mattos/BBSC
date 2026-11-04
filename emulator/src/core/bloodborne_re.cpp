@@ -10412,6 +10412,272 @@ void TickBbscBossGoodsCheck() {
     }
 }
 
+// ---- Key-item ledger -----------------------------------------------------------------------------
+// Idea and key list adapted from BBSC-GL (mark3317/BBSC-GL, same GPL code base; credit to its author).
+// Per BBSC-GL, unconfirmed here: give 0x017D89F0 adds locally, then queues window 0x016D8850. Away
+// (global+0x1592 == 0) the guest saves its own world, so the item is gone at home but stays "taken".
+constexpr u64 BbscLedgerGiveWindow1 = 0x017D934D; // return addresses inside the give 0x017D89F0
+constexpr u64 BbscLedgerGiveWindow2 = 0x017D94CC;
+constexpr u64 BbscItemWindowQueueOffset = 0x016D8850;
+
+bool BbscItemLedgerEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("SHADPS4_BBSC_ITEM_LEDGER");
+        return value == nullptr || std::string_view(value) != "0";
+    }();
+    return enabled;
+}
+
+// Keys, workshop tools, hunter badges, chalices, messenger ribbons (BBSC-GL's IsBbscRetroGoods).
+// Not NPC quest items, Laurence's Skull or the Eye Pendant.
+bool IsBbscLedgerKeyGoods(u32 goods) {
+    return (goods >= 4000 && goods <= 4021 && goods != 4014 && goods != 4017) ||
+           (goods >= 4102 && goods <= 4105) || (goods >= 4110 && goods <= 4120) ||
+           (goods >= 4903 && goods <= 4908) || (goods >= 6100 && goods <= 6539);
+}
+
+// Header line, then one goods id per line.
+std::vector<u32> ParseBbscLedgerText(std::string_view text) {
+    std::vector<u32> ids;
+    size_t at = 0;
+    bool header = true;
+    while (at < text.size()) {
+        size_t end = text.find('\n', at);
+        if (end == std::string_view::npos) {
+            end = text.size();
+        }
+        std::string_view line = text.substr(at, end - at);
+        at = end + 1;
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) {
+            line.remove_suffix(1);
+        }
+        if (header) {
+            header = false;
+            if (line != "BBSC-ITEM-LEDGER 1") {
+                return ids;
+            }
+            continue;
+        }
+        u32 id = 0;
+        const auto [ptr, ec] = std::from_chars(line.data(), line.data() + line.size(), id);
+        if (ec == std::errc{} && ptr == line.data() + line.size() && IsBbscLedgerKeyGoods(id) &&
+            std::ranges::find(ids, id) == ids.end()) {
+            ids.push_back(id);
+        }
+    }
+    return ids;
+}
+
+std::string FormatBbscLedgerText(const std::vector<u32>& ids) {
+    std::string out = "BBSC-ITEM-LEDGER 1\n";
+    for (const u32 id : ids) {
+        out += std::to_string(id);
+        out += '\n';
+    }
+    return out;
+}
+
+std::mutex bbsc_item_ledger_mutex;
+std::vector<u32> bbsc_item_ledger;                 // goods owed to the bound character
+std::optional<BbscSaveSlot> bbsc_item_ledger_slot; // the character the list belongs to
+bool bbsc_item_ledger_dirty = false;               // not on disk yet
+
+std::filesystem::path BbscItemLedgerPath(const BbscSaveSlot& slot) {
+    return Common::FS::GetUserPath(Common::FS::PathType::CapturesDir).parent_path() /
+           "item-ledger" / fmt::format("owed-{}-{}.txt", slot.user, slot.slot);
+}
+
+// Never throws: runs in the game tick.
+void WriteBbscItemLedgerLocked() {
+    if (!bbsc_item_ledger_dirty || !bbsc_item_ledger_slot.has_value()) {
+        return;
+    }
+    try {
+        std::error_code ec;
+        const auto path = BbscItemLedgerPath(*bbsc_item_ledger_slot);
+        if (bbsc_item_ledger.empty()) {
+            std::filesystem::remove(path, ec);
+            bbsc_item_ledger_dirty = false;
+            return;
+        }
+        std::filesystem::create_directories(path.parent_path(), ec);
+        const auto temp = std::filesystem::path(path).concat(".tmp");
+        {
+            std::ofstream file(temp, std::ios::binary | std::ios::trunc);
+            const std::string text = FormatBbscLedgerText(bbsc_item_ledger);
+            file.write(text.data(), static_cast<std::streamsize>(text.size()));
+            if (!file) {
+                LOG_WARNING(Debug, "BBSC item ledger: could not write {}", temp.string());
+                return;
+            }
+        }
+        std::filesystem::rename(temp, path, ec);
+        if (ec) {
+            LOG_WARNING(Debug, "BBSC item ledger: could not replace {}: {}", path.string(),
+                        ec.message());
+            return;
+        }
+        bbsc_item_ledger_dirty = false;
+    } catch (const std::exception& e) {
+        LOG_WARNING(Debug, "BBSC item ledger: file error ({})", e.what());
+    }
+}
+
+// Other character's list is written first; notes from before a slot was known merge into this one.
+void BindBbscItemLedgerLocked(const BbscSaveSlot& slot) {
+    if (bbsc_item_ledger_slot.has_value() && bbsc_item_ledger_slot->user == slot.user &&
+        bbsc_item_ledger_slot->slot == slot.slot) {
+        return;
+    }
+    std::vector<u32> carry; // noted while no character was known: the first one found owns it
+    if (bbsc_item_ledger_slot.has_value()) {
+        WriteBbscItemLedgerLocked();
+    } else {
+        carry = bbsc_item_ledger;
+    }
+    bbsc_item_ledger.clear();
+    bbsc_item_ledger_slot = slot;
+    try {
+        std::ifstream file(BbscItemLedgerPath(slot), std::ios::binary);
+        if (file) {
+            const std::string text{std::istreambuf_iterator<char>(file),
+                                   std::istreambuf_iterator<char>()};
+            bbsc_item_ledger = ParseBbscLedgerText(text);
+        }
+    } catch (const std::exception& e) {
+        LOG_WARNING(Debug, "BBSC item ledger: could not read the file ({})", e.what());
+    }
+    for (const u32 id : carry) {
+        if (std::ranges::find(bbsc_item_ledger, id) == bbsc_item_ledger.end()) {
+            bbsc_item_ledger.push_back(id);
+            bbsc_item_ledger_dirty = true;
+        }
+    }
+    LOG_INFO(Debug, "BBSC item ledger: user {} slot {} is owed {} key item(s)", slot.user, slot.slot,
+             bbsc_item_ledger.size());
+}
+
+// Item window 0x016D8850: rdi queue, rsi handle, rdx type, rcx id, r8 count.
+void PS4_SYSV_ABI BbscItemLedgerWindowHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
+    if (registers == nullptr || !BbscItemLedgerEnabled() || image_base == 0 ||
+        !ReadablePointer(registers->rsp, 8)) {
+        return;
+    }
+    const u64 caller = ReadValue<u64>(registers->rsp, 0);
+    const u64 offset = caller >= image_base ? caller - image_base : 0;
+    if (offset != BbscLedgerGiveWindow1 && offset != BbscLedgerGiveWindow2) {
+        return; // a talk's window, BBSC's own notice, a vanilla award
+    }
+    const u32 type = static_cast<u32>(registers->rdx);
+    const u32 id = static_cast<u32>(registers->rcx);
+    if (type != 0x40000000u || !IsBbscLedgerKeyGoods(id) || !BbscGuestLootActive()) {
+        return;
+    }
+    std::scoped_lock lock{bbsc_item_ledger_mutex};
+    if (std::ranges::find(bbsc_item_ledger, id) != bbsc_item_ledger.end()) {
+        return;
+    }
+    bbsc_item_ledger.push_back(id);
+    bbsc_item_ledger_dirty = true;
+    LOG_INFO(Debug, "BBSC item ledger: key goods {} taken in the host's world - noted, put back "
+                    "at home if the trip loses it",
+             id);
+    BBSC_TIMELINE("ITEMS", "item ledger: key goods {} taken in the host's world - noted", id);
+}
+
+u64 BbscStorageInventory(); // see "Restock"
+
+void TickBbscItemLedger() {
+    static s64 last_ms = 0;
+    static s64 slot_ms = 0;
+    static s64 home_since_ms = 0;
+    static s64 try_ms = 0;
+    static int tries = 0;
+    if (!BbscItemLedgerEnabled() || image_base == 0) {
+        return;
+    }
+    const s64 now = SteadyNowMs();
+    if (now - last_ms < 1'000) {
+        return;
+    }
+    last_ms = now;
+    const u64 global = GetGlobalState();
+    const bool home = GetSessionState() == 0 && ReadablePointer(global, 0x1593) &&
+                      ReadValue<u8>(global, 0x08) == 0 && ReadValue<u8>(global, 0x1592) != 0 &&
+                      GetCharacterHp(GetLocalPlayerCharacter()) > 0;
+    if (!home) {
+        home_since_ms = 0;
+        tries = 0;
+    } else if (home_since_ms == 0) {
+        home_since_ms = now;
+    }
+    const bool settled_home = home && now - home_since_ms >= 5'000;
+    bool want_slot = settled_home;
+    {
+        std::scoped_lock lock{bbsc_item_ledger_mutex};
+        want_slot = want_slot || bbsc_item_ledger_dirty;
+        WriteBbscItemLedgerLocked(); // within a second, so a crash keeps the notes
+        want_slot = want_slot && (bbsc_item_ledger_dirty || settled_home);
+    }
+    if (!want_slot || now - slot_ms < 5'000) {
+        return;
+    }
+    slot_ms = now;
+    const auto slot = BbscActiveSaveSlot();
+    if (!slot.has_value()) {
+        return;
+    }
+    std::vector<u32> owed;
+    {
+        std::scoped_lock lock{bbsc_item_ledger_mutex};
+        BindBbscItemLedgerLocked(*slot);
+        WriteBbscItemLedgerLocked();
+        owed = bbsc_item_ledger;
+    }
+    if (!settled_home || owed.empty() || tries >= 3 || now - try_ms < 5'000) {
+        return;
+    }
+    const u64 carried = BbscCarriedInventory();
+    const u64 storage = BbscStorageInventory();
+    if (carried == 0 || storage == 0) {
+        return; // inventory not up yet: not a try
+    }
+    try_ms = now;
+    ++tries;
+    std::vector<u32> settled;
+    for (const u32 id : owed) {
+        const u32 code = 0x40000000u | id;
+        if (BbscInventoryHas(carried, code) || BbscInventoryHas(storage, code)) {
+            settled.push_back(id);
+            LOG_INFO(Debug, "BBSC item ledger: key goods {} - still held after the trip, nothing "
+                            "to give",
+                     id);
+            BBSC_TIMELINE("ITEMS", "item ledger: key goods {} still held after the trip", id);
+        } else if (GiveBbscBossGoods({0, id, 1, 0})) {
+            settled.push_back(id);
+            LOG_WARNING(Debug, "BBSC CHECK FAIL item-ledger-lost-on-trip: key goods {} was gone at "
+                               "home - put back into the carried items",
+                        id);
+            BBSC_TIMELINE("ITEMS", "item ledger: key goods {} was lost on the trip - put back", id);
+            BbscAnnounce(u"A key item lost on the trip was put back into your items.",
+                         "item ledger");
+        } else {
+            LOG_WARNING(Debug, "BBSC CHECK FAIL item-ledger-give: key goods {} not given (try {} of "
+                               "3) - stays owed",
+                        id, tries);
+            BBSC_TIMELINE("ITEMS", "item ledger: key goods {} not given (try {} of 3)", id, tries);
+        }
+    }
+    if (settled.empty()) {
+        return;
+    }
+    std::scoped_lock lock{bbsc_item_ledger_mutex};
+    std::erase_if(bbsc_item_ledger,
+                  [&settled](u32 id) { return std::ranges::find(settled, id) != settled.end(); });
+    bbsc_item_ledger_dirty = true;
+    WriteBbscItemLedgerLocked();
+}
+
 // Game tick: award the queued boss lots, once each.
 void TickBbscBossRewards() {
     std::vector<s64> due;
@@ -12700,6 +12966,12 @@ void InstallBbscFloorGuardAndPickupTrace() {
     const bool treasure =
         InstallGuestCodeHook(reinterpret_cast<void*>(image_base + 0x012FDC17),
                              std::span<const u8>{TreasureSite}, 4, BbscPickupHook);
+    static constexpr std::array<u8, 6> WindowPrologue{0x55, 0x48, 0x89, 0xE5, 0x41, 0x57};
+    if (!InstallGuestCodeHook(reinterpret_cast<void*>(image_base + BbscItemWindowQueueOffset),
+                              std::span<const u8>{WindowPrologue}, 0, BbscItemLedgerWindowHook)) {
+        LOG_ERROR(Debug, "BBSC item ledger: window hook failed - key items taken as a guest are "
+                         "not noted");
+    }
     LOG_INFO(Debug, "BBSC pickup trace: reach={} treasure={} accepted={} take={} give={}", reach,
              treasure, accepted, take, give);
 }
@@ -16044,6 +16316,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         TickBbscCoopCountFix();
         TickBbscGuestTypeWatch();
         TickBbscBossGoodsCheck();
+        TickBbscItemLedger();
         TickBbscRespawnPointWatch();
         TickBbscHostTime();
         TickBbscHomeSpot();
