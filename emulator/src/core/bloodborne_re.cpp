@@ -13099,6 +13099,10 @@ constexpr u8 BbscToolCompareEqual = 0x40;   // ESD integer 0
 constexpr u8 BbscToolCompareAtMost = 0x43;  // ESD integer 3
 std::mutex bbsc_tool_mutex;
 std::vector<std::pair<size_t, u64>> bbsc_tool_sites; // {check index, address of the comparison byte}
+// 64 MB blocks that held a site on an earlier scan, searched first by the next one.
+constexpr u64 BbscToolWindowSize = 64ULL << 20;
+constexpr size_t BbscToolWindowsMax = 16;
+std::vector<Core::Bbsc::ScanWindow> bbsc_tool_windows;
 std::atomic<bool> bbsc_tool_scan_running{false};
 std::atomic<bool> bbsc_tool_scan_done{false};
 
@@ -13125,6 +13129,8 @@ s64 bbsc_tool_next_retry_ms = 0;
 
 // `wanted`: bit i = BbscDreamToolChecks[i]. One walk for all of them, three walks took 80-90 s.
 // `retry`: later look for missed checks, sites are added to the ones already found.
+// Blocks that held a site before are looked at first and their sites go live at once; the walk
+// over all memory then adds what they missed.
 void StartBbscToolScan(u32 wanted, bool retry) {
     if (bbsc_tool_scan_running.exchange(true)) {
         return;
@@ -13143,17 +13149,66 @@ void StartBbscToolScan(u32 wanted, bool retry) {
                 index.push_back(i);
             }
         }
-        std::vector<std::pair<size_t, u64>> sites;
-        for (const auto& [needle, hit] :
-             Core::Bbsc::FindAnyInMemory(needles, BbscScanLow(), 0x10000000000ULL, 8)) {
-            sites.emplace_back(index[needle], hit + 7);
+        const auto to_sites = [&](const std::vector<std::pair<size_t, u64>>& hits) {
+            std::vector<std::pair<size_t, u64>> found;
+            for (const auto& [needle, hit] : hits) {
+                found.emplace_back(index[needle], hit + 7);
+            }
+            return found;
+        };
+        // A new visit starts no scan while one runs, so a scan of an earlier visit still sets the
+        // sites; a retry only adds to its own visit.
+        bool published = false;
+        const auto publish = [&](const std::vector<std::pair<size_t, u64>>& found) {
+            std::scoped_lock lock{bbsc_tool_mutex};
+            if (retry && visit != bbsc_tool_visit.load()) {
+                return;
+            }
+            if (!retry && !published) {
+                bbsc_tool_sites.clear();
+            }
+            published = true;
+            for (const auto& site : found) {
+                if (std::ranges::find(bbsc_tool_sites, site) == bbsc_tool_sites.end()) {
+                    bbsc_tool_sites.push_back(site);
+                }
+            }
+        };
+        std::vector<Core::Bbsc::ScanWindow> windows;
+        {
+            std::scoped_lock lock{bbsc_tool_mutex};
+            windows = bbsc_tool_windows;
+        }
+        if (!windows.empty()) {
+            const auto quick = to_sites(Core::Bbsc::FindAnyInWindows(needles, windows, 8));
+            publish(quick);
+            LOG_INFO(Debug, "BBSC Dream: workshop tool scan{}: {} remembered block(s) gave {} "
+                            "site(s) in {} ms",
+                     retry ? " (retry)" : "", windows.size(), quick.size(), SteadyNowMs() - began);
+        }
+        std::vector<Core::Bbsc::ScanWindow> regions;
+        const auto hits = Core::Bbsc::FindAnyInMemory(needles, BbscScanLow(), 0x10000000000ULL, 8,
+                                                      &regions);
+        const auto sites = to_sites(hits);
+        publish(sites);
+        for (size_t i = 0; i < sites.size(); ++i) {
+            LOG_INFO(Debug, "BBSC Dream: workshop tool check {} found at 0x{:x} (region 0x{:x}, "
+                            "size 0x{:x})",
+                     BbscDreamToolChecks[sites[i].first].item, sites[i].second,
+                     i < regions.size() ? regions[i].base : 0,
+                     i < regions.size() ? regions[i].size : 0);
         }
         {
             std::scoped_lock lock{bbsc_tool_mutex};
-            if (!retry) {
-                bbsc_tool_sites = sites;
-            } else if (visit == bbsc_tool_visit.load()) {
-                bbsc_tool_sites.insert(bbsc_tool_sites.end(), sites.begin(), sites.end());
+            for (const auto& site : sites) {
+                const u64 base = site.second & ~(BbscToolWindowSize - 1);
+                if (std::ranges::none_of(bbsc_tool_windows,
+                                         [base](const auto& w) { return w.base == base; })) {
+                    if (bbsc_tool_windows.size() >= BbscToolWindowsMax) {
+                        bbsc_tool_windows.erase(bbsc_tool_windows.begin());
+                    }
+                    bbsc_tool_windows.push_back({base, BbscToolWindowSize});
+                }
             }
         }
         LOG_INFO(Debug, "BBSC Dream: workshop tool scan{} took {} ms ({} site(s) for {} check(s))",

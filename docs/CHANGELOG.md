@@ -33,6 +33,8 @@ Not tested in game:
 - Banner when the host may run another BBSC. Relay frame "SHAD" 0x28 + u8 BbscProtocolLevel; raise the level when
   packets change. Stock players ignore the frame, so a compatible stock host also shows the banner.
 - Workshop checks are found in one memory walk (FindAnyInMemory), retried every 20 s up to 4 times per Dream visit.
+- Workshop checks: the memory walk does less work per step, and the 64 MB blocks that held a site are searched first on the next
+  scan, so repeat visits open at once; the first visit still waits for the walk (126 s before; log "workshop tool scan took N ms").
 - Enemy drops for a guest (SHADPS4_BBSC_GUEST_ITEMS): goods that do not fit the carried items go to the storage box, and a
   partial fit sends the rest there (log: "put into the storage box", "no room" with both fit answers). Weapons, blood gems
   and attire are kept in guest-items/owed-drops-<user>-<slot>.txt and awarded at home, one every 10 s, by the game's award
