@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-11-04 - Weapons, blood gems and attire dropped for a guest are awarded at home
+
+- Weapons, blood gems and attire are kept in guest-items/owed-drops-<user>-<slot>.txt and awarded at
+  home, one every 10 s, by the game's award 0x017DDC50 with the other entries of the lot's row zeroed
+  for the call. A line is removed before its award. Category 15 is still not given. Not checked:
+  whether the award takes the changed row.
+- Drops rolled before the game has saved this character are kept in memory and dropped on a quit to
+  the title, because the next save may belong to another character.
+
 ## 2026-11-04 - Enemy drops for a guest: storage box, none right after a load
 
 - With SHADPS4_BBSC_GUEST_ITEMS, goods that do not fit the carried items go to the storage box, and a
