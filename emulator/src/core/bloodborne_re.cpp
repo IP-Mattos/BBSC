@@ -7956,6 +7956,9 @@ struct BbscLoadCoverState {
     bool active = false;
     bool game_screen_seen = false; // the game's own loading screen has shown during this cover
     bool own_screen = false;       // BBSC opened the loading screen (between / after the loads)
+    bool open_called = false;      // BBSC asked for it at least once: End closes it
+    s32 screen_state = 0;          // MenuMan+0x804 as last logged
+    s64 last_open_ms = 0;
     s64 started_ms = 0;
     s64 load_over_ms = 0;          // the game's loading screen closed and no load is running
     s64 no_session_since_ms = 0;
@@ -7990,8 +7993,10 @@ void EndBbscLoadCover(std::string_view how) {
     if (bbsc_load_cover.why == "summon") {
         bbsc_join_quiet_until_ms = SteadyNowMs() + 8'000; // the join banner filter (BbscJoinQuiet)
     }
-    if (bbsc_load_cover.own_screen) {
+    if (bbsc_load_cover.own_screen || bbsc_load_cover.open_called) {
+        LOG_INFO(Debug, "BBSC load cover: closing the loading screen BBSC opened ({})", how);
         bbsc_load_cover.own_screen = false;
+        bbsc_load_cover.open_called = false;
         // own_screen = the screen showed: never 0 while shown (see KeepClosingBbscLoadingScreen).
         KeepClosingBbscLoadingScreen("load cover");
     }
@@ -8059,9 +8064,22 @@ void TickBbscLoadCover() {
     // until it comes up we ask for the death kind (MenuMan+0x808 = 2, what the stage flow sets for a
     // death reload). Black only before and after the load (the flash of the new map before the
     // guest is placed).
+    // 2026-11: with one load in the cover the user saw plain black for the whole join: the game's
+    // screen state sat at "asked" (1) or "closing" (3 / 4) and the old test read every non-zero as
+    // "the game's screen is up", so BBSC never opened its own. Only "shown" (2) and the closing
+    // states leave it to the game now; "asked" gets 1.5 s, then BBSC asks itself (at most every 2 s,
+    // so it does not fight the game's own request), and a state 0 gets it at once after a shown
+    // screen or after 1.5 s of cover. The screen is never opened over a shown one (no flicker).
     if (const u64 menu = ReadValue<u64>(image_base + MenuManPointerOffset, 0);
         ReadablePointer(menu, 0x810)) {
-        if (ReadValue<s32>(menu, 0x804) != 0) {
+        const s32 state = ReadValue<s32>(menu, 0x804);
+        const s64 held = now - bbsc_load_cover.started_ms;
+        if (state != bbsc_load_cover.screen_state) {
+            LOG_INFO(Debug, "BBSC load cover: loading screen state {} -> {} ({} ms into the cover)",
+                     bbsc_load_cover.screen_state, state, held);
+            bbsc_load_cover.screen_state = state;
+        }
+        if (state >= 2) {
             if (!bbsc_load_cover.game_screen_seen) {
                 bbsc_load_cover.game_screen_seen = true;
                 LOG_INFO(Debug, "BBSC load cover: the game's loading screen is up (kind {})",
@@ -8069,24 +8087,28 @@ void TickBbscLoadCover() {
             }
             return;
         }
-        if (!bbsc_load_cover.game_screen_seen) {
+        const bool ask = !BbscCurtainActive() && (state == 0 ? (bbsc_load_cover.game_screen_seen ||
+                                                                held >= 1'500)
+                                                              : held >= 1'500);
+        if (state == 0 && !bbsc_load_cover.game_screen_seen && !ask) {
             WriteValue<s32>(menu, 0x808, 2);
-        } else if (!BbscCurtainActive()) {
-            // 2026-10-05 (tester): "it shows me pop in for a second and then it shows me the load
-            // screen and then it shows me" - between the summon load and the join's second reload
-            // (and after a load, until the guest is placed) the black plate did not hide the map.
-            // The game's loading screen closed with its load, so BBSC opens it again (the death
+        } else if (ask && now - bbsc_load_cover.last_open_ms >= (state == 0 ? 0 : 2'000)) {
+            // The game's screen closed with its load (or never came): BBSC opens it (the death
             // curtain's kind) and keeps it up until EndBbscLoadCover; a load in between runs its
-            // own on top. HYPOTHESIS until a test shows no pop-in.
+            // own on top.
+            bbsc_load_cover.last_open_ms = now;
             bbsc_loading_close_ms = 0; // the cover owns the loading screen now
+            bbsc_load_cover.open_called = true;
             if (BbscLoadingScreen(true)) {
                 if (!bbsc_load_cover.own_screen) {
-                    LOG_INFO(Debug, "BBSC load cover: loading screen kept up until the guest is "
-                                    "placed ({})",
-                             bbsc_load_cover.why);
+                    LOG_INFO(Debug, "BBSC load cover: loading screen opened by BBSC and kept up "
+                                    "until the guest is placed ({}; state {}, {} ms in)",
+                             bbsc_load_cover.why, state, held);
                 }
                 bbsc_load_cover.own_screen = true;
             }
+        } else if (state == 1) {
+            return; // asked, the game's menu script is about to show it
         }
     }
     if (now - bbsc_load_cover.started_ms < static_cast<s64>(BbscLoadCoverFadeOutS * 1000.0f)) {
