@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-11-04 - Enemy drops for a guest: storage box, none right after a load
+
+- With SHADPS4_BBSC_GUEST_ITEMS, goods that do not fit the carried items go to the storage box, and a
+  partial fit sends the rest there (log: "put into the storage box", or "no room" with both fit
+  answers). Not checked: why some goods "did not fit" (a stack at its carry limit is the likely
+  cause).
+- Enemy deaths in the 15 s after a load (the host's world replays its dead ones then) give a guest no
+  drops. The log counts them ("enemy death(s) right after the load ignored"). Echoes are not gated.
+
 ## 2026-10-04 (c) - mod 11: Silencing Blank ends the co-op cleanly; Memory Altar for the guest
 
 - New tool: tools\gamedata\lua50.py - reads the game's compiled Lua (Lua 5.0 with one extra empty list

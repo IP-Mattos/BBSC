@@ -10610,6 +10610,14 @@ void TickBbscDreamShopGuard() {
 std::mutex bbsc_guest_drop_mutex;
 std::vector<std::pair<s32, u32>> bbsc_guest_drop_queue; // (item lot, NpcParam row id or 0)
 
+// Right after a load the guest's game replays the deaths already in the host's world in a few
+// bursts (3 to 12 s after the character is created), each one running the kill reward as if just
+// killed. Deaths up to this long after the game's load flag (global+0x08) was last set are not
+// rolled; a guest's own kill in that time is lost too.
+constexpr s64 BbscDeathQuietAfterLoadMs = 15'000;
+std::atomic<s64> bbsc_death_quiet_until_ms{0};
+std::atomic<s32> bbsc_deaths_ignored{0};
+
 void NoteBbscGuestEnemyDeath(u64 dead) {
     static const bool enabled = EnvFlagEnabled("SHADPS4_BBSC_GUEST_ITEMS");
     if (!enabled || image_base == 0 || !BbscGuestInHostWorld() || GetLocalPlayerType() != 1 ||
@@ -10627,6 +10635,10 @@ void NoteBbscGuestEnemyDeath(u64 dead) {
     if (!ReadablePointer(row, 0x150) || ((ReadValue<u8>(row, 329) >> 4) & 1) != 0) {
         return; // no NpcParam row (a player), or a boss
     }
+    if (SteadyNowMs() < bbsc_death_quiet_until_ms.load()) {
+        bbsc_deaths_ignored.fetch_add(1);
+        return;
+    }
     std::scoped_lock lock{bbsc_guest_drop_mutex};
     for (size_t i = 0; i < 2; ++i) {
         const s32 lot = ReadValue<s32>(row, 0x2C + i * 4);
@@ -10642,17 +10654,32 @@ void NoteBbscGuestEnemyDeath(u64 dead) {
 // STRONGLY INDICATED. BBSC now rolls the lot itself, as the award does without Discovery: the game's
 // own ItemLotParam row (BbscGameParamTable), one entry picked by lotItemBasePoint01-08 (an entry with
 // no item is "nothing"), a one-time drop (get flag on) is not given twice. Goods (category 4) go
-// straight into the carried items - no popup. Blood gems (8), weapons (0), attire (1) and category 15
-// would need the award and its popup, so a guest does not get them for now (logged, timeline ITEMS).
+// straight into the carried items - no popup, what does not fit goes to the storage box. Blood gems
+// (8), weapons (0), attire (1) and category 15 would need the award and its popup, so a guest does
+// not get them for now (logged, timeline ITEMS).
 u64 BbscGameParamTable(std::string_view type);       // see "The BBSC hunter's kit"
 u64 BbscParamRow(u64 table, u32 id, size_t size);   // see "The BBSC hunter's kit"
 constexpr size_t ItemLotRowSize = 0x94;
 
-// Puts goods into the carried items as the kit and the boss goods do; the slot, or -1.
-s32 AddBbscCarriedGoods(u32 goods, s32 count) {
+u64 BbscStorageInventory();                      // see "Restock"
+s32 BbscInventoryCount(u64 inventory, u32 code); // see "Restock"
+
+// What GiveBbscGuestGoods placed; fits_* is what 0x014D9A80 answered for the first ask there.
+struct BbscGoodsPlaced {
+    s32 carried = 0;
+    s32 stored = 0;
+    s32 fits_carried = -1;
+    s32 fits_stored = -1;
+};
+
+// The game's own give (0x017D89F0) asks 0x014D9A80 / adds with 0x014DA0A0 on the carried items,
+// then on the storage box for the rest; so does this. A partial fit sends the remainder on; each add
+// is counted by the stack size before and after.
+BbscGoodsPlaced GiveBbscGuestGoods(u32 goods, s32 count) {
+    BbscGoodsPlaced placed;
     const u64 carried = BbscCarriedInventory();
     if (carried == 0 || count <= 0) {
-        return -1;
+        return placed;
     }
     using Fits = s32 PS4_SYSV_ABI (*)(u64 inventory, const u32* code, s32 count);
     using Add = s32 PS4_SYSV_ABI (*)(u64 inventory, const u32* key, s32 count);
@@ -10660,13 +10687,24 @@ s32 AddBbscCarriedGoods(u32 goods, s32 count) {
     alignas(16) static u32 key = 0;
     code = 0x40000000u | goods;
     key = 0x80000000u | (3u << 28) | goods;
-    const s32 fits = reinterpret_cast<Fits>(image_base + 0x014D9A80)(carried, &code, count);
-    if (fits <= 0) {
-        return -1;
+    s32 left = count;
+    for (const u64 destination : {carried, BbscStorageInventory()}) {
+        if (destination == 0 || left <= 0) {
+            continue;
+        }
+        const bool is_carried = destination == carried;
+        const s32 fits = reinterpret_cast<Fits>(image_base + 0x014D9A80)(destination, &code, left);
+        (is_carried ? placed.fits_carried : placed.fits_stored) = fits;
+        if (fits <= 0) {
+            continue;
+        }
+        const s32 before = BbscInventoryCount(destination, code);
+        reinterpret_cast<Add>(image_base + 0x014DA0A0)(destination, &key, std::min(fits, left));
+        const s32 added = std::clamp(BbscInventoryCount(destination, code) - before, 0, left);
+        (is_carried ? placed.carried : placed.stored) += added;
+        left -= added;
     }
-    const s32 slot =
-        reinterpret_cast<Add>(image_base + 0x014DA0A0)(carried, &key, std::min(fits, count));
-    return slot >= 0 && BbscInventoryHas(carried, code) ? slot : -1;
+    return placed;
 }
 
 void GiveBbscGuestDrop(s32 lot, u32 name) {
@@ -10727,25 +10765,55 @@ void GiveBbscGuestDrop(s32 lot, u32 name) {
                       kind, item, lot);
         return;
     }
-    const s32 slot = AddBbscCarriedGoods(static_cast<u32>(item), count);
-    if (slot >= 0 && flag > 0) {
+    const BbscGoodsPlaced placed = GiveBbscGuestGoods(static_cast<u32>(item), count);
+    const s32 given = placed.carried + placed.stored;
+    if (given > 0 && flag > 0) {
         using SetEventFlag = u64 PS4_SYSV_ABI (*)(u64 unused, u32 flag, u8 value);
         reinterpret_cast<SetEventFlag>(image_base + 0x0132E5A0)(0, static_cast<u32>(flag), 1);
     }
-    LOG_INFO(Debug, "BBSC guest drop: enemy (name id {}) died - goods {} x{} from lot {} {}", name,
-             item, count, lot,
-             slot >= 0 ? fmt::format("put into the carried items (slot {})", slot)
-                       : std::string{"did not fit (carried items full)"});
-    BBSC_TIMELINE("ITEMS", "guest drop: goods {} x{} from lot {} {}", item, count, lot,
-                  slot >= 0 ? "added" : "did not fit");
+    std::string outcome;
+    if (given == 0) {
+        outcome = fmt::format("no room (carried items fit {}, storage box fits {})",
+                              placed.fits_carried, placed.fits_stored);
+    } else {
+        if (placed.carried > 0) {
+            outcome = fmt::format("{} put into the carried items", placed.carried);
+        }
+        if (placed.stored > 0) {
+            outcome += fmt::format("{}{} put into the storage box", outcome.empty() ? "" : ", ",
+                                   placed.stored);
+        }
+        if (given < count) {
+            outcome += fmt::format(", {} lost: no room in either", count - given);
+        }
+    }
+    LOG_INFO(Debug, "BBSC guest drop: enemy (name id {}) died - goods {} x{} from lot {}: {}", name,
+             item, count, lot, outcome);
+    BBSC_TIMELINE("ITEMS", "guest drop: goods {} x{} from lot {}: {}", item, count, lot, outcome);
     static s64 notice_ms = 0;
-    if (slot >= 0 && SteadyNowMs() - notice_ms > 15'000) {
+    if (given > 0 && SteadyNowMs() - notice_ms > 15'000) {
         notice_ms = SteadyNowMs();
-        BbscAnnounce(u"An item was added to your items.", "enemy drop");
+        BbscAnnounce(placed.stored > 0 ? u"An item was added to your items or storage box."
+                                       : u"An item was added to your items.",
+                     "enemy drop");
     }
 }
 
 void TickBbscGuestDrops() {
+    {
+        const s64 now = SteadyNowMs();
+        const u64 loading_state = GetGlobalState();
+        if (ReadablePointer(loading_state, 0x10) && ReadValue<u8>(loading_state, 0x08) != 0) {
+            bbsc_death_quiet_until_ms.store(now + BbscDeathQuietAfterLoadMs);
+        } else if (now >= bbsc_death_quiet_until_ms.load()) {
+            if (const s32 ignored = bbsc_deaths_ignored.exchange(0); ignored > 0) {
+                LOG_INFO(Debug, "BBSC guest drop: {} enemy death(s) right after the load ignored",
+                         ignored);
+                BBSC_TIMELINE("ITEMS", "guest drop: {} enemy death(s) right after the load ignored",
+                              ignored);
+            }
+        }
+    }
     std::vector<std::pair<s32, u32>> due;
     {
         std::scoped_lock lock{bbsc_guest_drop_mutex};
