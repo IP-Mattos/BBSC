@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-11-04 - Warning when the host may run another BBSC
+
+- Every BBSC sends a version frame, "SHAD" 0x28 + u8 protocol level, on connecting, when another
+  player joins the server and before it rings a sign. A guest whose sign is rung by a host with another
+  level, or with no version frame (stock 0.0.2 and older builds ignore it), gets a notice: "The host's
+  BBSC may be a different version. If joining fails, you both need the same BBSC." Raise
+  BbscProtocolLevel in bbsc_relay.cpp when BBSC packets change in a way an older build cannot read.
+
 ## 2026-11-04 - Notice when a host rang the sign but the join failed
 
 - A guest whose sign was rung (HTTP claim delivered) but never became a join now gets an on-screen
