@@ -11311,116 +11311,50 @@ bool MakeBbscDreamNpcsSolid() {
     return false;
 }
 
-// Logs the guest entering and leaving the host's Dream.
-// ---- Workshop tools in the host's Dream (2026-10-04) ---------------------------------------------
-// Report 2026-10-01/04: at the Memory Altar the guest gets "The workshop tool required for this task
-// is missing." (FMG 30 10011070). t210699 (the altar) opens only if f47(3, 4104, 0, 1, 0) == 1 -
-// the LOCAL player holds key item 4104, the Rune Workshop Tool - and t210692 (the workbench) gates
-// Blood Gem Fortification and Arcane Haze the same way on 4103 / 4102. In the host's Dream the
-// guest should have what the host has. The host's tools are known on the guest's side: event
-// 12100450 sets 6630 (4103), 6631 (4104), 6632 (4105), 6633 (4102) for the tools held, and group 6
-// is part of the host's Dream state the guest receives (BbscDreamStateKeys).
-// The check is ESD expression bytecode in the loaded talk script (read off the files with
-// tools/gamedata): 6F 43 82 <item i32> 40 41 40 89 = f47(3, item, 0, 1, 0), third argument = the
-// comparison (0 count == 1; 3 count <= 1). On the guest's machine only, while the guest is in the
-// host's Dream and the host has that tool, the comparison byte is set to 3 (true with or without
-// the tool); it goes back to 0 on leaving. The scripts are found by these bytes off the game
-// thread and every write re-checks the bytes around it.
-struct BbscToolCheck {
-    u32 item;
-    u32 host_flag;
-    const char* what;
+// ---- Workshop tools in the host's Dream ---------------------------------------------------------
+// At the Memory Altar the guest gets "The workshop tool required for this task is missing." (FMG 30
+// 10011070). t210699 (the altar) opens only if f47(3, 4104, 0, 1, 0) == 1 - the LOCAL player holds
+// key item 4104, the Rune Workshop Tool - and t210692 (the workbench) gates Blood Gem Fortification
+// and Arcane Haze the same way on 4103 / 4102. In the host's Dream the guest should have what the
+// host has.
+// Case 47 of the talk condition dispatcher 0x0203AD60 (f47(type, item, ...) = compare the held
+// count of an item) ends every path at 0x0203EE48 with r13d = the count, r15d = the comparison,
+// [rbp-0x368] = the item id, [rbp-0x360] = the item type (0x40000000 goods), [rbp-0x370] = the
+// value compared with. The hook sets the count to 1 for the three tools while the guest is in the
+// host's Dream, so every comparison of the script (== 1, <= 1) passes. Nothing is written to the
+// script or the inventory.
+constexpr u64 TalkItemCountJoinOffset = 0x0203EE48; // MOV EAX, R15D / CMP R15D, 5
+constexpr u32 BbscToolItemMin = 4102;
+constexpr u32 BbscToolItemMax = 4104; // 4105 is left out
+constexpr u32 BbscToolItemTypeGoods = 0x40000000;
+constexpr std::array<const char*, 3> BbscToolNames{
+    "Workshop Haze Extractor (4102, workbench Arcane Haze)",
+    "Blood Gem Workshop Tool (4103, workbench blood gems)",
+    "Rune Workshop Tool (4104, Memory Altar)",
 };
-constexpr std::array<BbscToolCheck, 3> BbscDreamToolChecks{{
-    {4104, 6631, "Memory Altar (Rune Workshop Tool)"},
-    {4103, 6630, "workbench blood gems (Blood Gem Workshop Tool)"},
-    {4102, 6633, "workbench Arcane Haze (Workshop Haze Extractor)"},
-}};
-constexpr u8 BbscToolCompareEqual = 0x40;   // ESD integer 0
-constexpr u8 BbscToolCompareAtMost = 0x43;  // ESD integer 3
-std::mutex bbsc_tool_mutex;
-std::vector<std::pair<size_t, u64>> bbsc_tool_sites; // {check index, address of the comparison byte}
-std::atomic<bool> bbsc_tool_scan_running{false};
-std::atomic<bool> bbsc_tool_scan_done{false};
+std::array<bool, 3> bbsc_dream_tool_logged{}; // cleared on leaving the Dream
 
-std::array<u8, 11> BbscToolCheckBytes(u32 item, u8 compare) {
-    return {0x6F, 0x43, 0x82, static_cast<u8>(item), static_cast<u8>(item >> 8),
-            static_cast<u8>(item >> 16), static_cast<u8>(item >> 24), compare, 0x41, 0x40, 0x89};
-}
-
-// The 11 bytes around `site` still read like this check with either comparison.
-bool BbscToolSiteIntact(u64 site, u32 item) {
-    if (!HasMemoryAccess(site - 7, 11, MemoryProt::CpuWrite)) {
-        return false;
-    }
-    std::array<u8, 11> here{};
-    std::memcpy(here.data(), reinterpret_cast<const void*>(site - 7), here.size());
-    return here == BbscToolCheckBytes(item, BbscToolCompareEqual) ||
-           here == BbscToolCheckBytes(item, BbscToolCompareAtMost);
-}
-
-void StartBbscToolScan() {
-    if (bbsc_tool_scan_running.exchange(true)) {
+void PS4_SYSV_ABI BbscDreamToolCountHook(u64 /*tag*/, const GuestRegisterSnapshot* registers) {
+    if (registers == nullptr) {
         return;
     }
-    bbsc_tool_scan_done = false;
-    std::thread([] {
-        std::vector<std::pair<size_t, u64>> sites;
-        for (size_t i = 0; i < BbscDreamToolChecks.size(); ++i) {
-            const auto needle = BbscToolCheckBytes(BbscDreamToolChecks[i].item, BbscToolCompareEqual);
-            for (const u64 hit :
-                 Core::Bbsc::FindInMemory(needle, BbscScanLow(), 0x10000000000ULL, 8)) {
-                sites.emplace_back(i, hit + 7);
-            }
-        }
-        {
-            std::scoped_lock lock{bbsc_tool_mutex};
-            bbsc_tool_sites = std::move(sites);
-        }
-        bbsc_tool_scan_done = true;
-        bbsc_tool_scan_running = false;
-    }).detach();
-}
-
-// Game thread, while the guest is in the host's Dream (restore = on leaving).
-void TickBbscDreamTools(bool restore) {
-    static s64 last_ms = 0;
-    static std::array<int, 3> logged{-1, -1, -1};
-    const s64 now = SteadyNowMs();
-    if (!restore && now - last_ms < 1'000) {
+    const u32 item = ReadValue<u32>(registers->rbp - 0x368, 0);
+    if (item < BbscToolItemMin || item > BbscToolItemMax || !BbscDreamEnabled() ||
+        ReadValue<u32>(registers->rbp - 0x360, 0) != BbscToolItemTypeGoods ||
+        GetCurrentPackedMap() != BbscHuntersDreamMap || !BbscGuestInHostWorld()) {
         return;
     }
-    last_ms = now;
-    std::scoped_lock lock{bbsc_tool_mutex};
-    std::array<int, 3> found{};
-    for (const auto& [index, site] : bbsc_tool_sites) {
-        const BbscToolCheck& check = BbscDreamToolChecks[index];
-        if (!BbscToolSiteIntact(site, check.item)) {
-            continue;
-        }
-        const bool host_has = !restore && BbscEventFlag(check.host_flag);
-        const u8 want = host_has ? BbscToolCompareAtMost : BbscToolCompareEqual;
-        if (ReadValue<u8>(site, 0) != want) {
-            WriteValue<u8>(site, 0, want);
-        }
-        found[index] = host_has ? 2 : 1;
-    }
-    if (restore) {
-        bbsc_tool_sites.clear();
-        logged = {-1, -1, -1};
-        return;
-    }
-    for (size_t i = 0; i < found.size(); ++i) {
-        if (bbsc_tool_scan_done && found[i] != logged[i]) {
-            logged[i] = found[i];
-            LOG_INFO(Debug, "BBSC Dream: {} - {}", BbscDreamToolChecks[i].what,
-                     found[i] == 0   ? "check not found in memory"
-                     : found[i] == 2 ? "host has the tool, guest may use it"
-                                     : "host does not have the tool either");
-        }
+    const u32 held = static_cast<u32>(registers->r13);
+    const_cast<GuestRegisterSnapshot*>(registers)->r13 = 1;
+    bool& logged = bbsc_dream_tool_logged[item - BbscToolItemMin];
+    if (!logged) {
+        logged = true;
+        LOG_INFO(Debug, "BBSC Dream: {} - the guest holds {}, taken as held",
+                 BbscToolNames[item - BbscToolItemMin], held);
     }
 }
 
+// Logs the guest entering and leaving the host's Dream.
 void TickBbscDream() {
     static bool in_dream = false;
     static bool npcs_solid = false;
@@ -11431,22 +11365,18 @@ void TickBbscDream() {
         npcs_solid = MakeBbscDreamNpcsSolid();
     }
     const bool now = GetCurrentPackedMap() == BbscHuntersDreamMap && BbscGuestInHostWorld();
-    if (now && in_dream) {
-        TickBbscDreamTools(false);
-    }
     if (now == in_dream) {
         return;
     }
     in_dream = now;
     if (now) {
-        StartBbscToolScan();
         LOG_INFO(Debug,
                  "BBSC Dream: guest in the host's Hunter's Dream - Doll, Gehrman{}, workshop and "
                  "messengers open to the guest; headstones and Ritual Altars stay the host's",
                  BbscNightIsOver() ? " (silent: the night is over)" : "");
     } else {
         LOG_INFO(Debug, "BBSC Dream: guest left the Hunter's Dream");
-        TickBbscDreamTools(true);
+        bbsc_dream_tool_logged.fill(false);
         bbsc_dream_talk_logged = 0;
         bbsc_dream_tools_logged = false;
         bbsc_dream_type_logged.fill(0);
@@ -11988,14 +11918,20 @@ void InstallBbscDreamHooks() {
     }
     static constexpr std::array<u8, 5> TalkSite{0x4A, 0x8B, 0x7C, 0xE9, 0x18};
     static constexpr std::array<u8, 6> TypeCheckPrologue{0x55, 0x48, 0x89, 0xE5, 0x41, 0x57};
+    static constexpr std::array<u8, 7> ItemCountSite{0x44, 0x89, 0xF8, 0x41, 0x83, 0xFF, 0x05};
     const bool talk = InstallGuestCodeHook(
         reinterpret_cast<void*>(image_base + TalkClientCheckedOffset), std::span<const u8>{TalkSite},
         0, BbscDreamTalkHook);
     const bool type = InstallGuestCodeHook(
         reinterpret_cast<void*>(image_base + CharacterTypeCheckOffset),
         std::span<const u8>{TypeCheckPrologue}, 1, BbscDreamTypeCheckHook, &bbsc_dream_type_skip);
-    if (!talk || !type) {
-        LOG_ERROR(Debug, "BBSC Dream: hooks failed (talk {}, event type check {})", talk, type);
+    const bool tools = InstallGuestCodeHook(
+        reinterpret_cast<void*>(image_base + TalkItemCountJoinOffset),
+        std::span<const u8>{ItemCountSite}, 2, BbscDreamToolCountHook);
+    if (!talk || !type || !tools) {
+        LOG_ERROR(Debug,
+                  "BBSC Dream: hooks failed (talk {}, event type check {}, workshop tools {})",
+                  talk, type, tools);
         return;
     }
     LOG_INFO(Debug,

@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-11-04 - Workshop checks answered in the talk script, no memory scan
+
+- The guest's check for the Rune Workshop Tool, the Blood Gem Workshop Tool and the Workshop Haze
+  Extractor (items 4104, 4103, 4102) is answered where the talk condition dispatcher ends its case 47
+  (0x0203EE48): while the guest is in the host's Dream the held count of those items reads 1, so the
+  altar and the workbench open at once. Nothing is written to the script or the inventory.
+- Replaces the search of the whole process for the check bytes (the scan thread, the bytes patched
+  in place and put back on leaving the Dream).
+
 ## 2026-10-04 (c) - mod 11: Silencing Blank ends the co-op cleanly; Memory Altar for the guest
 
 - New tool: tools\gamedata\lua50.py - reads the game's compiled Lua (Lua 5.0 with one extra empty list
