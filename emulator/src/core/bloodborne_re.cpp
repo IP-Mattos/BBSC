@@ -11794,6 +11794,14 @@ void TickBbscDreamShopGuard() {
 std::mutex bbsc_guest_drop_mutex;
 std::vector<std::pair<s32, u32>> bbsc_guest_drop_queue; // (item lot, NpcParam row id or 0)
 
+// Right after a load the guest's game replays the deaths already in the host's world in a few
+// bursts (3-12 s after the character is created, on every map in the logs), each one running the
+// kill reward as if just killed. Deaths up to this long after the game's load flag (global+0x08)
+// last read set are not rolled; a guest's own kill in that time is lost too.
+constexpr s64 BbscDeathQuietAfterLoadMs = 15'000;
+std::atomic<s64> bbsc_death_quiet_until_ms{0};
+std::atomic<s32> bbsc_deaths_ignored{0};
+
 void NoteBbscGuestEnemyDeath(u64 dead) {
     static const bool enabled = EnvFlagEnabled("SHADPS4_BBSC_GUEST_ITEMS");
     if (!enabled || image_base == 0 || !BbscGuestInHostWorld() || GetLocalPlayerType() != 1 ||
@@ -11810,6 +11818,10 @@ void NoteBbscGuestEnemyDeath(u64 dead) {
     const u64 row = ReadablePointer(info, 0x10) ? ReadValue<u64>(info, 8) : 0;
     if (!ReadablePointer(row, 0x150) || ((ReadValue<u8>(row, 329) >> 4) & 1) != 0) {
         return; // no NpcParam row (a player), or a boss
+    }
+    if (SteadyNowMs() < bbsc_death_quiet_until_ms.load()) {
+        bbsc_deaths_ignored.fetch_add(1);
+        return;
     }
     std::scoped_lock lock{bbsc_guest_drop_mutex};
     for (size_t i = 0; i < 2; ++i) {
@@ -12143,6 +12155,20 @@ void GiveBbscGuestDrop(s32 lot, u32 name) {
 }
 
 void TickBbscGuestDrops() {
+    {
+        const s64 now = SteadyNowMs();
+        const u64 loading_state = GetGlobalState();
+        if (ReadablePointer(loading_state, 0x10) && ReadValue<u8>(loading_state, 0x08) != 0) {
+            bbsc_death_quiet_until_ms.store(now + BbscDeathQuietAfterLoadMs);
+        } else if (now >= bbsc_death_quiet_until_ms.load()) {
+            if (const s32 ignored = bbsc_deaths_ignored.exchange(0); ignored > 0) {
+                LOG_INFO(Debug, "BBSC guest drop: {} enemy death(s) right after the load ignored",
+                         ignored);
+                BBSC_TIMELINE("ITEMS", "guest drop: {} enemy death(s) right after the load ignored",
+                              ignored);
+            }
+        }
+    }
     std::vector<std::pair<s32, u32>> due;
     {
         std::scoped_lock lock{bbsc_guest_drop_mutex};

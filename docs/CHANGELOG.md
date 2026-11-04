@@ -34,7 +34,8 @@ Not tested in game:
   and attire are kept in guest-items/owed-drops-<user>-<slot>.txt and awarded at home, one every 10 s, by the game's award
   0x017DDC50 with the other entries of the lot's row zeroed for the call; a line is removed before its award. Category 15 is
   still not given. Whether the award takes the changed row, and the cause of the "did not fit" lines (indicated: a stack at
-  its carry limit), were not checked.
+  its carry limit), were not checked. Enemy deaths in the 15 s after a load (the host's world replays its dead ones then)
+  give a guest no drops; the log counts them ("enemy death(s) right after the load ignored"). Echoes are not gated.
 
 Installer: bbport/INSTALAR-BBSC.cmd downloads BBport 1.9.7 and this kit, checks each sha256, and updates
 bbport-files.json so BBport stops warning about the replaced bin files. Test mode only so far; the account step, file
