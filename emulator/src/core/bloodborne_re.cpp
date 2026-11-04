@@ -5107,7 +5107,7 @@ void TickBbscFollowHost() {
         attempts_map = host.packed_map;
         attempts = 0;
     }
-    if (attempts >= BbscFollowMaxAttempts) {
+    if (attempts >= BbscFollowMaxAttempts && !stub_reload) { // the Chalice reload is counted apart
         return; // gave up on this map; a new host map starts a fresh count
     }
     // Load the host's world, not our own: its flags for that map first (sent every second).
@@ -7166,8 +7166,10 @@ void OnBbscChaliceLoader(const GuestRegisterSnapshot& registers) {
 // Game thread. True once per record: we stand in area 29 after a load that built no dungeon and the
 // host's record is in our flags and read back. Not for a host, a solo player or a load with a layout.
 bool BbscChaliceStubReloadWanted(bool settled) {
+    // The stub load can leave the map list empty (map 0), so 0 counts too, but only in a stub state.
+    const u32 here = GetCurrentPackedMap();
     if (bbsc_chalice_layout_state.load() != 1 || !settled || !bbsc_chalice_applied.active ||
-        BbscMapArea(GetCurrentPackedMap()) != BbscChaliceArea) {
+        (here != 0 && BbscMapArea(here) != BbscChaliceArea)) {
         return false;
     }
     if (bbsc_chalice_stub_reloaded_key == bbsc_chalice_applied.key) {
