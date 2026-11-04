@@ -3292,6 +3292,7 @@ void WriteEnginePanicStack(std::ostream& out, const GuestRegisterSnapshot& regis
 // The guest's loads under the death curtain's fade, see "Load cover".
 void StartBbscLoadCover(std::string_view why);
 void EndBbscLoadCover(std::string_view how);
+bool BbscChaliceHoldsLoadCover(); // the join load built no Chalice dungeon: the reload follows
 // The host's world state for a follow load, see "World state when warping together".
 bool BbscHostWorldFlagsReady(u32 packed_map);
 bool ApplyBbscHostWorldFlags(u32 packed_map, std::string_view why);
@@ -4689,6 +4690,13 @@ void TickBbscJoinTeleport() {
              "({:.2f}, {:.2f}, {:.2f})",
              own ? own->position[0] : 0.0f, own ? own->position[1] : 0.0f,
              own ? own->position[2] : 0.0f, position[0], position[1], position[2]);
+    if (BbscChaliceHoldsLoadCover()) {
+        // No world between the two loads: the cover stays up for the Chalice reload that follows.
+        LOG_INFO(Debug, "BBSC load cover: kept up after the join teleport - the join load built no "
+                        "Chalice dungeon and the reload follows");
+        BBSC_TIMELINE("LOAD", "load cover: kept up through the Chalice reload");
+        return;
+    }
     EndBbscLoadCover("guest placed beside the host");
 }
 
@@ -4961,7 +4969,7 @@ void TickBbscFollowHost() {
         chalice_told = false;
         // Joined while the host was inside: that load had no record and built no dungeon (layout id
         // -1, grey screen), and the record only arrives afterwards. One reload, now it is in.
-        stub_reload = !warping && BbscChaliceStubReloadWanted(settled);
+        stub_reload = !warping && BbscChaliceStubReloadWanted(now - last_load_ms >= 1'500);
         host.packed_map = BbscChaliceLoadMap; // the load forces this map whatever the host's id
     } else {
         chalice_told = false;
@@ -5100,10 +5108,10 @@ void TickBbscFollowHost() {
     if (mismatch_since_ms == 0) {
         mismatch_since_ms = now;
     }
-    if (now - mismatch_since_ms < BbscFollowMismatchMs) {
+    if (now - mismatch_since_ms < BbscFollowMismatchMs && !stub_reload) {
         return;
     }
-    if (!settled || GetCharacterHp(GetLocalPlayerCharacter()) <= 0) {
+    if ((!settled && !stub_reload) || GetCharacterHp(GetLocalPlayerCharacter()) <= 0) {
         return; // just out of a load, or dead: the follow waits (the wipe/respawn logic owns this)
     }
     if (attempts_map != host.packed_map) {
@@ -7086,6 +7094,9 @@ std::atomic<s64> bbsc_chalice_load_ms{0};
 // What the loader (0x01FF8D20) saw in the newest chalice load: 0 nothing yet, 1 layout id -1 (no
 // dungeon built), 2 a real layout id.
 std::atomic<int> bbsc_chalice_layout_state{0};
+// A guest's join load built no dungeon: the load cover is kept up until the reload (0 = no hold).
+std::atomic<s64> bbsc_chalice_hold_ms{0};
+constexpr s64 BbscChaliceHoldMs = 20'000;
 u64 bbsc_chalice_stub_reloaded_key = 0; // record the one allowed reload was spent on
 void OnBbscChaliceLoad(const GuestRegisterSnapshot& registers) {
     if (image_base == 0 || !ReadablePointer(registers.rsi, 0x0C) ||
@@ -7097,6 +7108,21 @@ void OnBbscChaliceLoad(const GuestRegisterSnapshot& registers) {
     bbsc_chalice_layout_state.store(0);
     const bool guest = BbscGuestLootActive();
     std::string refusal;
+    // A summoned guest whose host record is already here (it comes with the host's first packets)
+    // writes it before this load reads it: the dungeon is built at once and no reload is needed.
+    const s32 session = GetSessionState();
+    bool record_here = false;
+    {
+        std::scoped_lock lock{bbsc_chalice_mutex};
+        record_here = bbsc_chalice_host.received_ms != 0 &&
+                      SteadyNowMs() - bbsc_chalice_host.received_ms <= BbscChaliceFreshMs;
+    }
+    if (!guest && (session == 4 || session == 6) && !bbsc_chalice_applied.active && record_here &&
+        !ApplyBbscChaliceRecord("summon load", true, refusal)) {
+        LOG_WARNING(Debug, "BBSC chalice: summon load of map {:#x} - the host's record is not in "
+                           "yet: {}",
+                    map, refusal);
+    }
     if (guest && bbsc_chalice_applied.active && !ApplyBbscChaliceRecord("load", true, refusal)) {
         // Never load on a mix of the host's record and our bits: ours whole, as before the follow.
         LOG_WARNING(Debug, "BBSC chalice: load of map {:#x} - record not written again ({}), our own "
@@ -7157,9 +7183,16 @@ void OnBbscChaliceLoader(const GuestRegisterSnapshot& registers) {
     const u32 first = ReadValue<u32>(registers.rsi, 0);
     if (first != 0xFFFFFFFF) {
         bbsc_chalice_layout_state.store(2); // a real layout wins over any empty call of the load
+        bbsc_chalice_hold_ms.store(0);
     } else {
         int none = 0;
-        bbsc_chalice_layout_state.compare_exchange_strong(none, 1);
+        if (bbsc_chalice_layout_state.compare_exchange_strong(none, 1) &&
+            (GetSessionState() == 4 || GetSessionState() == 6)) {
+            bbsc_chalice_hold_ms.store(SteadyNowMs()); // a summoned guest: hold the load cover
+            LOG_INFO(Debug, "BBSC load cover: the guest's load built no Chalice dungeon - held "
+                            "through the record write and the reload (at most {} s)",
+                     BbscChaliceHoldMs / 1000);
+        }
     }
     const u64 hash = BbscFnv1a(reinterpret_cast<const void*>(registers.rsi), 0x58);
     static u64 logged = 0;
@@ -7194,7 +7227,25 @@ bool BbscChaliceStubReloadWanted(bool settled) {
     return true;
 }
 
+// True while the cover is to stay up for the reload; false (and the hold gone) once the dungeon
+// turned out real, the time is up, or the reload has been asked for (its own arrival ends the cover).
+bool BbscChaliceHoldsLoadCover() {
+    const s64 since = bbsc_chalice_hold_ms.load();
+    if (since == 0) {
+        return false;
+    }
+    if (bbsc_chalice_layout_state.load() == 2 || SteadyNowMs() - since > BbscChaliceHoldMs) {
+        bbsc_chalice_hold_ms.store(0);
+        LOG_WARNING(Debug, "BBSC load cover: hold for the Chalice reload lifted ({})",
+                    bbsc_chalice_layout_state.load() == 2 ? "a real dungeon loaded"
+                                                          : "the reload did not start in time");
+        return false;
+    }
+    return true;
+}
+
 void NoteBbscChaliceStubReload() {
+    bbsc_chalice_hold_ms.store(0); // the reload's arrival ends the cover from here
     bbsc_chalice_stub_reloaded_key = bbsc_chalice_applied.key;
     bbsc_chalice_layout_state.store(0);
     LOG_INFO(Debug, "BBSC chalice: reload into {:#x} requested - the join load built no dungeon "
@@ -7960,6 +8011,12 @@ void TickBbscLoadCover() {
     const s64 now = SteadyNowMs();
     if (now - bbsc_load_cover.started_ms > BbscLoadCoverLimitMs) {
         EndBbscLoadCover("time limit");
+        return;
+    }
+    // Held for a Chalice reload that never came (refused, record missing, time up): lift it.
+    if (bbsc_chalice_hold_ms.load() != 0 && !BbscChaliceHoldsLoadCover() &&
+        bbsc_join_teleport_done) {
+        EndBbscLoadCover("Chalice hold lifted");
         return;
     }
     const s32 session_state = GetSessionState();
