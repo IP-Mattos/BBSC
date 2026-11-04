@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-11-04 - Chalice Dungeon co-op: a guest follows the host in
+
+- Area 29 has one map id for every Chalice Dungeon, so the packet that tells a guest where the host is
+  cannot name the dungeon. The load setup (0x01928680) takes it from the event flags: slot = 7 -
+  bitlength(flags 9020..9026) and the record at flag group 94000 + 100 * slot and 94001 + 100 * slot.
+- The host sends both groups and the 9020 value (SignalingBbscWorldFlags version 3, at once when they
+  change, otherwise every 5 s). Older builds ignore it.
+- A guest keeps its own copy in the own-world journal, writes the host's record, reads the 9020 bits
+  back and only then loads map 0x1D000000. If the record is missing or does not read back it stays
+  out and a notice says so. The record is written again at the load (0x01928680) and after a Dream
+  restore. Its own record and 9020 bits come back on leaving the dungeon, at home or after a crash.
+- The map's own flags (doors, levers, bosses) go through the normal world sync for map 0x1D000000.
+  Nothing Chalice-specific was added for them. Log lines start "BBSC chalice:".
+
 ## 2026-11-04 - Own-world journal: keep an earlier journal, check the character, park on quit
 
 - A journal an earlier run left on disk is merged before the first write and its copies win: what is
