@@ -3305,6 +3305,9 @@ void CaptureBbscOwnWorldBeforeJoin();
 void WriteBbscOwnWorldFile();
 void NoteBbscOwnDreamRestored(u32 key, const u8* live);
 void RestoreBbscOwnChaliceBits(std::string_view why); // see "Chalice Dungeon record"
+void PatchBbscOwnChaliceBits(u8* group9);             // our 9020 bits into a kept copy of group 9
+void KeepBbscChaliceBitsAfterDream();                 // the host's 9020 bits over a Dream restore
+void ClearBbscChaliceHostRecord();
 s32 GetSessionState();
 u32 GetCurrentPackedMap();
 // The map as of the last game tick, for code on other threads (the relay's placement packets):
@@ -5170,8 +5173,8 @@ void TickBbscFollowHost() {
 // world has them taken (2026-09-26, "guest can't see items"). The guest writes them into its own table right before it
 // asks for the follow load and again when that load creates its character (0x0178D9C0 hook), which
 // is before the new map's events first run. Global groups (flags below 100000: story, NPC quests)
-// are left alone. Only the live table of the host's world changes: while a guest, the save is
-// written from the own-world snapshot (0x0156AA50, global+0x1592 == 0), as in vanilla co-op.
+// are left alone. Only the live table changes, but the save writer 0x01399DE0 dumps it (man+0x28)
+// directly: a save written meanwhile holds the host's flags, hence the own world journal below.
 constexpr u64 WorldFlagManPointerOffset = 0x0553B100;
 constexpr std::array<u32, 4> BbscWorldFlagKinds{1, 6, 7, 5};
 constexpr size_t BbscWorldGroupCount = BbscWorldFlagKinds.size() * 10;
@@ -5197,8 +5200,8 @@ static_assert(BbscWorldGroupCount <= 64 && BbscWorldChunkCount <= 8);
 // While the host stands in the Dream it sends these too (version 2 of SignalingBbscWorldFlags,
 // ignored by older builds). A guest writes them into its live table when it loads into the Dream,
 // after keeping its own copy, and puts its own copy back when it leaves the Dream or the session -
-// keeping every bit the game itself changed meanwhile (a purchase, a message read). The save is
-// written from the own-world snapshot while the guest is away (0x0156AA50, global+0x1592 == 0).
+// keeping every bit the game itself changed meanwhile (a purchase, a message read). A save written
+// meanwhile holds the host's groups (0x01399DE0 dumps the live table), see the own world journal.
 constexpr std::array<u32, 57> BbscDreamStateKeys{
     1,     2,     5,     6,     7,     9,     2100,  12117, 12207, 12301, 12307, 12400,
     12407, 12411, 12417, 12427, 12507, 12601, 12607, 12707, 12801, 12807, 12907, 12910,
@@ -5336,6 +5339,7 @@ void ClearBbscHostWorldSnapshots() {
     bbsc_world_blocks.clear();
     bbsc_dream_assembling = {};
     bbsc_dream_ready = {};
+    ClearBbscChaliceHostRecord();
 }
 
 // Host side: one snapshot of `count` groups (group n = key_of(map, n)) in chunks of 8. Returns the
@@ -5772,6 +5776,9 @@ void ApplyBbscHostDreamState(std::string_view why) {
         KeepBbscOwnWorldGroup(BbscDreamStateKeys[i], live);
         if ((bbsc_dream_own.held & (u64{1} << i)) == 0) {
             std::memcpy(bbsc_dream_own.own[i].data(), live, BbscWorldGroupBytes);
+            if (BbscDreamStateKeys[i] == 9) {
+                PatchBbscOwnChaliceBits(bbsc_dream_own.own[i].data()); // group 9 holds 9020
+            }
             bbsc_dream_own.held |= u64{1} << i;
         }
         for (size_t b = 0; b < BbscWorldGroupBytes; ++b) {
@@ -5828,6 +5835,7 @@ void RestoreBbscOwnDreamState(std::string_view why) {
         ++restored;
     }
     bbsc_dream_own.held = 0;
+    KeepBbscChaliceBitsAfterDream();
     LOG_INFO(Debug,
              "BBSC Dream state ({}): our own Dream flags are back ({} groups, {} flags the game "
              "changed meanwhile kept)",
@@ -6173,15 +6181,34 @@ void CaptureBbscOwnWorldBeforeJoin() {
     WriteBbscOwnWorldFile();
 }
 
+// Flags 9020..9026 are bits 20..26 of group 9: the low nibble of byte 2 and the top three of byte 3.
+// A copy of group 9 kept or updated while the host's Chalice bits were live gets our own ones back.
+void PatchBbscOwnChaliceBits(u8* group9) {
+    const auto it = bbsc_own_world.find(BbscOwnChaliceKey);
+    if (it == bbsc_own_world.end() || it->second[1] != 1) {
+        return;
+    }
+    const u32 own = it->second[0] & 0x7F;
+    group9[2] = static_cast<u8>((group9[2] & ~0x0F) | (own >> 3));
+    group9[3] = static_cast<u8>((group9[3] & ~0xE0) | ((own & 7) << 5));
+}
+
 void NoteBbscOwnDreamRestored(u32 key, const u8* live) {
     if (BbscIsMapFlagGroup(key)) {
         return; // a map group: its first kept copy is the right one
     }
     if (const auto it = bbsc_own_world.find(key); it != bbsc_own_world.end()) {
         std::memcpy(it->second.data(), live, BbscWorldGroupBytes);
+        if (key == 9) {
+            PatchBbscOwnChaliceBits(it->second.data()); // the live bits may be the host's
+        }
         bbsc_own_world_dirty = true;
     }
 }
+
+// A journal found on disk that this run has not merged yet, see WriteBbscOwnWorldFile.
+bool bbsc_own_world_file_merged = false;
+bool LoadBbscOwnWorldFile(const BbscSaveSlot& slot, bool file_wins = false);
 
 void WriteBbscOwnWorldFile() {
     if (!bbsc_own_world_dirty || bbsc_own_world.empty()) {
@@ -6191,6 +6218,19 @@ void WriteBbscOwnWorldFile() {
         bbsc_own_world_slot = BbscActiveSaveSlot();
         if (!bbsc_own_world_slot.has_value()) {
             return; // no save written in this run yet: the next write tries again
+        }
+    }
+    if (!bbsc_own_world_file_merged) {
+        // A file an earlier run left holds the copies kept before the host's flags went in; what is
+        // in memory now may be a capture from a table that already held them (a save written then).
+        // Never replace it unmerged: its copies win.
+        bbsc_own_world_file_merged = true;
+        std::error_code exists_ec;
+        if (std::filesystem::exists(BbscOwnWorldPath(*bbsc_own_world_slot), exists_ec) &&
+            LoadBbscOwnWorldFile(*bbsc_own_world_slot, true)) {
+            LOG_WARNING(Debug, "BBSC own world: a journal from an earlier run exists for user {} slot "
+                               "{} - its copies win over the ones kept now",
+                        bbsc_own_world_slot->user, bbsc_own_world_slot->slot);
         }
     }
     std::vector<u8> out;
@@ -6223,7 +6263,7 @@ void WriteBbscOwnWorldFile() {
     }
 }
 
-bool LoadBbscOwnWorldFile(const BbscSaveSlot& slot) {
+bool LoadBbscOwnWorldFile(const BbscSaveSlot& slot, bool file_wins) {
     std::ifstream file(BbscOwnWorldPath(slot), std::ios::binary);
     u32 magic = 0, group_bytes = 0, count = 0;
     const auto get32 = [&file](u32& v) {
@@ -6239,9 +6279,17 @@ bool LoadBbscOwnWorldFile(const BbscSaveSlot& slot) {
         if (!get32(key) || !file.read(reinterpret_cast<char*>(bytes.data()), bytes.size())) {
             break;
         }
-        bbsc_own_world.try_emplace(key, bytes); // what is in memory already is newer
+        if (file_wins) {
+            bbsc_own_world[key] = bytes;
+        } else {
+            bbsc_own_world.try_emplace(key, bytes); // what is in memory already is newer
+        }
     }
     bbsc_own_world_slot = slot;
+    bbsc_own_world_file_merged = true;
+    if (file_wins) {
+        bbsc_own_world_dirty = true;
+    }
     return !bbsc_own_world.empty();
 }
 
@@ -6254,9 +6302,34 @@ bool BbscHomeForOwnWorld() {
            ReadValue<u64>(image_base + WorldFlagManPointerOffset, 0) != 0;
 }
 
+// The journal belongs to one character, known only as the newest save written this run: a different
+// one (quit to title, another character loaded and saved) must not get these groups. The file stays.
+bool BbscOwnJournalIsOurs() {
+    if (!bbsc_own_world_slot.has_value()) {
+        return true;
+    }
+    const auto active = BbscActiveSaveSlot();
+    if (!active.has_value() ||
+        (active->user == bbsc_own_world_slot->user && active->slot == bbsc_own_world_slot->slot)) {
+        return true;
+    }
+    static std::string logged;
+    const std::string now = fmt::format("{}/{}>{}/{}", bbsc_own_world_slot->user,
+                                        bbsc_own_world_slot->slot, active->user, active->slot);
+    if (now != logged) {
+        logged = now;
+        LOG_WARNING(Debug, "BBSC own world: the kept copy is user {} slot {}'s, the character now "
+                           "saving is user {} slot {} - not putting it back into that one",
+                    bbsc_own_world_slot->user, bbsc_own_world_slot->slot, active->user,
+                    active->slot);
+    }
+    return false;
+}
+
 // Our own groups back into the live table. Returns the groups written (0 = nothing kept).
 size_t RestoreBbscOwnWorld(std::string_view why) {
-    if (bbsc_own_world.empty() || image_base == 0 || !BbscHomeForOwnWorld()) {
+    if (bbsc_own_world.empty() || image_base == 0 || !BbscHomeForOwnWorld() ||
+        !BbscOwnJournalIsOurs()) {
         return 0;
     }
     if (bbsc_dream_own.held != 0) {
@@ -6324,6 +6397,7 @@ size_t RestoreBbscOwnWorld(std::string_view why) {
         std::filesystem::rename(path, std::filesystem::path(path).concat(".restored"), ec);
     }
     bbsc_own_world_slot.reset();
+    bbsc_own_world_file_merged = false;
     return restored;
 }
 
@@ -6539,6 +6613,12 @@ void BbscChaliceHashRecord(BbscChaliceRecord& record) {
 std::mutex bbsc_chalice_mutex;
 BbscChaliceRecord bbsc_chalice_host; // guest: the newest valid record from the host
 
+// The session is over: a later host's record must not meet this one inside its freshness window.
+void ClearBbscChaliceHostRecord() {
+    std::scoped_lock lock{bbsc_chalice_mutex};
+    bbsc_chalice_host = {};
+}
+
 // Arrives on the signaling receive thread: records the message only.
 void OnBbscChaliceRecordPacket(const Libraries::Np::NpSignaling::SignalingBbscWorldFlags& packet) {
     const u32 slot = packet.groups[2][0];
@@ -6670,6 +6750,7 @@ struct BbscChaliceApplied {
     bool active = false;
     u64 key = 0;
     s64 applied_ms = 0;
+    u32 bits = 0;
 };
 BbscChaliceApplied bbsc_chalice_applied; // game thread only
 
@@ -6705,6 +6786,14 @@ bool PutBbscOwnChaliceBits(u32& own, u32& was) {
     u32 back = 0;
     return BbscWriteFlagBits(BbscChaliceSlotFlag, BbscChaliceSlotBits, own) &&
            BbscReadFlagBits(BbscChaliceSlotFlag, BbscChaliceSlotBits, back) && back == own;
+}
+
+// After a Dream restore, which keeps "changed" bits and so mixes ours with the host's: the host's
+// 9020 bits whole again while the record is in.
+void KeepBbscChaliceBitsAfterDream() {
+    if (bbsc_chalice_applied.active && BbscGuestLootActive()) {
+        BbscWriteFlagBits(BbscChaliceSlotFlag, BbscChaliceSlotBits, bbsc_chalice_applied.bits);
+    }
 }
 
 // Called by RestoreBbscOwnWorld after the real groups (they are back already): the 9020 bits.
@@ -6750,6 +6839,15 @@ void RestoreBbscChaliceOwn(std::string_view why) {
     u32 was = 0;
     const bool ok = PutBbscOwnChaliceBits(own, was);
     if (ok) {
+        // Copies of group 9 made meanwhile may hold the host's bits: ours first, then the key goes.
+        if (const auto g9 = bbsc_own_world.find(BbscTimeGroupKey); g9 != bbsc_own_world.end()) {
+            PatchBbscOwnChaliceBits(g9->second.data());
+        }
+        for (size_t i = 0; i < BbscDreamGroupCount; ++i) {
+            if (BbscDreamStateKeys[i] == BbscTimeGroupKey && (bbsc_dream_own.held >> i & 1) != 0) {
+                PatchBbscOwnChaliceBits(bbsc_dream_own.own[i].data());
+            }
+        }
         bbsc_own_world.erase(BbscOwnChaliceKey);
     }
     LOG_INFO(Debug,
@@ -6768,6 +6866,7 @@ void RestoreBbscChaliceOwn(std::string_view why) {
             std::filesystem::rename(path, std::filesystem::path(path).concat(".restored"), ec);
         }
         bbsc_own_world_slot.reset();
+        bbsc_own_world_file_merged = false;
     } else {
         bbsc_own_world_dirty = true;
         WriteBbscOwnWorldFile();
@@ -6786,7 +6885,9 @@ bool ApplyBbscChaliceRecord(std::string_view why, bool force, std::string& refus
         refusal = "no record from the host";
         return false;
     }
-    if (SteadyNowMs() - host.received_ms > BbscChaliceFreshMs) {
+    // A record already written may be written again whatever its age (a load, a Dream restore).
+    const bool written = bbsc_chalice_applied.active && bbsc_chalice_applied.key == host.key;
+    if (!written && SteadyNowMs() - host.received_ms > BbscChaliceFreshMs) {
         refusal = "the host's record is older than 15 s";
         return false;
     }
@@ -6846,7 +6947,7 @@ bool ApplyBbscChaliceRecord(std::string_view why, bool force, std::string& refus
         return false;
     }
     const bool first = !bbsc_chalice_applied.active || bbsc_chalice_applied.key != host.key;
-    bbsc_chalice_applied = {true, host.key, SteadyNowMs()};
+    bbsc_chalice_applied = {true, host.key, SteadyNowMs(), host.bits};
     if (first) {
         LOG_INFO(Debug,
                  "BBSC chalice: ({}) written/read back ok - slot {}, 9020 {:#04x}, layout id {:#x}, "
@@ -6915,7 +7016,8 @@ void TickBbscChaliceGuest() {
     }
     const bool host_in_dungeon =
         BbscMapArea(host_map) == BbscChaliceArea && now - host_ms <= BbscFollowStaleMs;
-    if (!host_in_dungeon && now - bbsc_chalice_applied.applied_ms >= BbscChaliceLeaveMs) {
+    if (!host_in_dungeon && now - bbsc_chalice_applied.applied_ms >= BbscChaliceLeaveMs &&
+        BbscOwnJournalIsOurs()) {
         RestoreBbscChaliceOwn("out of the Chalice Dungeon");
     }
 }
@@ -6933,8 +7035,11 @@ void OnBbscChaliceLoad(const GuestRegisterSnapshot& registers) {
     const bool guest = BbscGuestLootActive();
     std::string refusal;
     if (guest && bbsc_chalice_applied.active && !ApplyBbscChaliceRecord("load", true, refusal)) {
-        LOG_WARNING(Debug, "BBSC chalice: load of map {:#x} - record not written again: {}", map,
-                    refusal);
+        // Never load on a mix of the host's record and our bits: ours whole, as before the follow.
+        LOG_WARNING(Debug, "BBSC chalice: load of map {:#x} - record not written again ({}), our own "
+                           "record put back",
+                    map, refusal);
+        RestoreBbscChaliceOwn("not written again at the load");
     }
     u32 bits = 0;
     BbscReadFlagBits(BbscChaliceSlotFlag, BbscChaliceSlotBits, bits);
@@ -6980,8 +7085,8 @@ void OnBbscChaliceLoader(const GuestRegisterSnapshot& registers) {
 // So when a load into the host's world starts or creates the guest's character, the kind 5 groups of
 // every block of that area (5AAB0..5AAB9 for B = 0..9; the blocks of one area join without a load)
 // are set to "taken this session" only. Bits that appeared since our last write are the guest's own
-// pickups and are kept from then on. Only the live table of the host's world changes: the guest's
-// save is written from the own-world snapshot while it is away (0x0156AA50, global+0x1592 == 0).
+// pickups and are kept from then on. Only the live table changes, but a save written meanwhile
+// dumps it (0x01399DE0), so it holds these flags until the journal puts the own ones back.
 //
 // Taken items on disk (2026-10-08, the user: "save what item the guest took from the host world and
 // make it untakable"). "Taken this session" was forgotten when the session ended, so a reconnect
