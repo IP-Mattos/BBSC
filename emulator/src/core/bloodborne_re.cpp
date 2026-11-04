@@ -6152,6 +6152,10 @@ void NoteBbscOwnDreamRestored(u32 key, const u8* live) {
     }
 }
 
+// A journal found on disk that this run has not merged yet, see WriteBbscOwnWorldFile.
+bool bbsc_own_world_file_merged = false;
+bool LoadBbscOwnWorldFile(const BbscSaveSlot& slot, bool file_wins = false);
+
 void WriteBbscOwnWorldFile() {
     if (!bbsc_own_world_dirty || bbsc_own_world.empty()) {
         return;
@@ -6160,6 +6164,19 @@ void WriteBbscOwnWorldFile() {
         bbsc_own_world_slot = BbscActiveSaveSlot();
         if (!bbsc_own_world_slot.has_value()) {
             return; // no save written in this run yet: the next write tries again
+        }
+    }
+    if (!bbsc_own_world_file_merged) {
+        // A file an earlier run left holds the copies kept before the host's flags went in; what is
+        // in memory now may be a capture from a table that already held them (a save written then).
+        // Never replace it unmerged: its copies win.
+        bbsc_own_world_file_merged = true;
+        std::error_code exists_ec;
+        if (std::filesystem::exists(BbscOwnWorldPath(*bbsc_own_world_slot), exists_ec) &&
+            LoadBbscOwnWorldFile(*bbsc_own_world_slot, true)) {
+            LOG_WARNING(Debug, "BBSC own world: a journal from an earlier run exists for user {} slot "
+                               "{} - its copies win over the ones kept now",
+                        bbsc_own_world_slot->user, bbsc_own_world_slot->slot);
         }
     }
     std::vector<u8> out;
@@ -6192,7 +6209,7 @@ void WriteBbscOwnWorldFile() {
     }
 }
 
-bool LoadBbscOwnWorldFile(const BbscSaveSlot& slot) {
+bool LoadBbscOwnWorldFile(const BbscSaveSlot& slot, bool file_wins) {
     std::ifstream file(BbscOwnWorldPath(slot), std::ios::binary);
     u32 magic = 0, group_bytes = 0, count = 0;
     const auto get32 = [&file](u32& v) {
@@ -6208,9 +6225,17 @@ bool LoadBbscOwnWorldFile(const BbscSaveSlot& slot) {
         if (!get32(key) || !file.read(reinterpret_cast<char*>(bytes.data()), bytes.size())) {
             break;
         }
-        bbsc_own_world.try_emplace(key, bytes); // what is in memory already is newer
+        if (file_wins) {
+            bbsc_own_world[key] = bytes;
+        } else {
+            bbsc_own_world.try_emplace(key, bytes); // what is in memory already is newer
+        }
     }
     bbsc_own_world_slot = slot;
+    bbsc_own_world_file_merged = true;
+    if (file_wins) {
+        bbsc_own_world_dirty = true;
+    }
     return !bbsc_own_world.empty();
 }
 
@@ -6223,9 +6248,34 @@ bool BbscHomeForOwnWorld() {
            ReadValue<u64>(image_base + WorldFlagManPointerOffset, 0) != 0;
 }
 
+// The journal belongs to one character, known only as the newest save written this run: a different
+// one (quit to title, another character loaded and saved) must not get these groups. The file stays.
+bool BbscOwnJournalIsOurs() {
+    if (!bbsc_own_world_slot.has_value()) {
+        return true;
+    }
+    const auto active = BbscActiveSaveSlot();
+    if (!active.has_value() ||
+        (active->user == bbsc_own_world_slot->user && active->slot == bbsc_own_world_slot->slot)) {
+        return true;
+    }
+    static std::string logged;
+    const std::string now = fmt::format("{}/{}>{}/{}", bbsc_own_world_slot->user,
+                                        bbsc_own_world_slot->slot, active->user, active->slot);
+    if (now != logged) {
+        logged = now;
+        LOG_WARNING(Debug, "BBSC own world: the kept copy is user {} slot {}'s, the character now "
+                           "saving is user {} slot {} - not putting it back into that one",
+                    bbsc_own_world_slot->user, bbsc_own_world_slot->slot, active->user,
+                    active->slot);
+    }
+    return false;
+}
+
 // Our own groups back into the live table. Returns the groups written (0 = nothing kept).
 size_t RestoreBbscOwnWorld(std::string_view why) {
-    if (bbsc_own_world.empty() || image_base == 0 || !BbscHomeForOwnWorld()) {
+    if (bbsc_own_world.empty() || image_base == 0 || !BbscHomeForOwnWorld() ||
+        !BbscOwnJournalIsOurs()) {
         return 0;
     }
     if (bbsc_dream_own.held != 0) {
@@ -6292,6 +6342,7 @@ size_t RestoreBbscOwnWorld(std::string_view why) {
         std::filesystem::rename(path, std::filesystem::path(path).concat(".restored"), ec);
     }
     bbsc_own_world_slot.reset();
+    bbsc_own_world_file_merged = false;
     return restored;
 }
 
@@ -6359,6 +6410,9 @@ bool BbscSaveSlotTrusted() {
 
 // A file an earlier run left (the game crashed or was closed while a guest): put back now.
 bool RecoverBbscOwnWorldFile(const BbscSaveSlot& slot) {
+    if (!BbscSaveSlotTrusted()) {
+        return false;
+    }
     if (!bbsc_own_world.empty() || !BbscHomeForOwnWorld() || !LoadBbscOwnWorldFile(slot)) {
         return false;
     }
@@ -6409,6 +6463,30 @@ void RestoreBbscOwnWorldAtLoad() {
     if (!bbsc_own_world.empty()) {
         RestoreBbscOwnWorld("during the home load");
     }
+}
+
+// Quit to title: another character can be loaded next, so the journal goes to its file and leaves
+// memory; the file is found again by its character's slot (RecoverBbscOwnWorldFile). Without a file
+// on disk (no save slot known yet) it stays in memory, as nothing else can hold it.
+void ParkBbscOwnWorld(std::string_view why) {
+    if (bbsc_own_world.empty()) {
+        return;
+    }
+    WriteBbscOwnWorldFile();
+    if (bbsc_own_world_dirty || !bbsc_own_world_slot.has_value()) {
+        LOG_WARNING(Debug,
+                    "BBSC own world ({}): the kept copy is not on disk yet, it stays in memory", why);
+        return;
+    }
+    LOG_INFO(Debug,
+             "BBSC own world ({}): {} kept group(s) left in user {} slot {}'s file, memory cleared",
+             why, bbsc_own_world.size(), bbsc_own_world_slot->user, bbsc_own_world_slot->slot);
+    BBSC_TIMELINE("WORLD", "own world ({}): kept groups left in the file, memory cleared", why);
+    bbsc_own_world.clear();
+    bbsc_own_world_dirty = false;
+    bbsc_own_world_slot.reset();
+    bbsc_own_world_file_merged = false;
+    bbsc_dream_own.held = 0;
 }
 
 // ---- Guest loot view (2026-09-27) --------------------------------------------------------------
@@ -8948,6 +9026,7 @@ void PS4_SYSV_ABI BbscQuitToTitleHook(u64, const GuestRegisterSnapshot* register
     BbscActiveSaveSlot(); // refreshes bbsc_active_save_time
     bbsc_parked_save_time = bbsc_active_save_time;
     ResetBbscOwedDropsForQuit();
+    ParkBbscOwnWorld("quit to title");
     SuspendBbscPersistence("quit to title");
 }
 

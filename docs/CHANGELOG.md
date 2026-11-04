@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-11-04 - Own-world journal: keep an earlier journal, check the character, park on quit
+
+- A journal an earlier run left on disk is merged before the first write and its copies win: what is
+  in memory may be a capture taken after the host's flags were already in the table.
+- Groups are put back only into the character that kept them (the newest save written this run). A
+  different character, loaded after a quit to the title, leaves the file alone.
+- Quit to the title writes the journal to its file and clears it from memory. No file is recovered
+  until a save newer than the quit exists.
+
 ## 2026-11-04 - Weapons, blood gems and attire dropped for a guest are awarded at home
 
 - Weapons, blood gems and attire are kept in guest-items/owed-drops-<user>-<slot>.txt and awarded at
