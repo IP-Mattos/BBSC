@@ -7206,8 +7206,7 @@ void NoteBbscChaliceStubReload() {
 }
 
 void ResetBbscChaliceStubReload() {
-    bbsc_chalice_stub_reloaded_key = 0;
-    bbsc_chalice_layout_state.store(0);
+    bbsc_chalice_stub_reloaded_key = 0; // the layout state stays: a solo stub load still needs it
 }
 
 // ---- Guest loot view (2026-09-27) --------------------------------------------------------------
