@@ -1,0 +1,38 @@
+name: Build BBSC mod
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the submodules the mod needs
+        run: git submodule update --init --depth 1 emulator/externals/fmt emulator/externals/xbyak
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build bbsc.dll and bbsc-launch.exe
+        shell: cmd
+        run: |
+          where clang-cl || set "PATH=C:\Program Files\LLVM\bin;%PATH%"
+          set "SRC=%GITHUB_WORKSPACE%\emulator\mod\"
+          set "EXT=%SRC%..\externals"
+          set "OUT=%GITHUB_WORKSPACE%\out"
+          set "OBJ=%OUT%\obj"
+          mkdir "%OBJ%"
+          set FLAGS=/nologo /std:c++latest /O2 /MT /EHsc /W3 /DNOMINMAX /DWIN32_LEAN_AND_MEAN /D_CRT_SECURE_NO_WARNINGS /DBBSC_MOD /DFMT_HEADER_ONLY /I "%SRC%shim" /I "%SRC%..\src" /I "%EXT%\fmt\include" /I "%EXT%\xbyak"
+          clang-cl %FLAGS% /LD "%SRC%bbsc_mod.cpp" "%SRC%bbsc_hooks.cpp" "%SRC%bbsc_relay.cpp" "%SRC%bbsc_channel.cpp" "%SRC%bbsc_http.cpp" "%SRC%bbsc_discord.cpp" "%SRC%..\src\core\bbsc_memscan.cpp" "%SRC%..\src\core\bloodborne_re.cpp" /Fo"%OBJ%\\" /Fe"%OUT%\bbsc.dll" /link ws2_32.lib winhttp.lib user32.lib || exit /b 1
+          clang-cl %FLAGS% "%SRC%bbsc_launch.cpp" /Fo"%OBJ%\\" /Fe"%OUT%\bbsc-launch.exe" /link user32.lib comdlg32.lib /SUBSYSTEM:WINDOWS /ENTRY:wmainCRTStartup || exit /b 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bbsc-mod
+          path: |
+            out/bbsc.dll
+            out/bbsc-launch.exe
