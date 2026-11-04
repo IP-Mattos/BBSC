@@ -19,6 +19,8 @@ Not tested in game:
   Chalice-specific was added for them and they were not checked. Lines start "BBSC chalice:".
   A guest who joins while the host is already inside gets the record after the first load, which built no dungeon
   (grey screen); it now reloads once into the dungeon when the record is in.
+  A player who loads alone into an empty Chalice stub (a crash as a guest left the save there) is sent to the spot they
+  joined from (the Hunter's Dream when that is not known), after their own record is back.
 - A guest who died and was left in the host's world after the session ended is sent home too (gray screen).
 - Boss rewards awarded by a follow-up event reach the guest: Logarius (12501800, Crown of Illusions, lot 2502000) and
   m35 (13501800, Celestial Dial, lot 3501800). The other template events are already in the table.

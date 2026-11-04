@@ -3301,6 +3301,8 @@ void KeepBbscOwnWorldGroup(u32 key, const u8* live); // see "Own world journal"
 void KeepBbscOwnTimeBits();                           // see "Time of night in the host's world"
 void ApplyBbscHostTime(std::string_view why);
 void KeepBbscHomeSpot();                              // see "Back home where we were"
+void NoteBbscRecoveredHomeSpot(const u8* bytes);      // the journal's copy of it, after a crash
+void KeepBbscHomeSpotInJournal();
 void CaptureBbscOwnWorldBeforeJoin();
 void WriteBbscOwnWorldFile();
 void NoteBbscOwnDreamRestored(u32 key, const u8* live);
@@ -3332,6 +3334,7 @@ void WriteLuaSessionEvent(std::ostream& out, const GuestRegisterSnapshot& regist
     }
     if (name == "JoinSession_White" && GetSessionState() != 3) {
         CaptureBbscOwnWorldBeforeJoin(); // first: the load resets the map's item flags
+        KeepBbscHomeSpotInJournal();
         StartBbscLoadCover("summon");
     }
     if (name == "OnLeaveMagic" || name == "OnLeaveMenu_Yes") {
@@ -6101,6 +6104,7 @@ constexpr size_t BbscTimeByte = 100;
 constexpr u8 BbscTimeMask = 0xE0;
 constexpr u32 BbscOwnTimeKey = 0xFFFF9800;
 constexpr u32 BbscOwnChaliceKey = 0xFFFF9020; // pseudo group: byte 0 = our 9020 bits, byte 1 = 1 when kept
+constexpr u32 BbscOwnHomeKey = 0xFFFF0A0E;    // pseudo group: the spot we joined from (BbscHomeSpot)
 constexpr s64 BbscHostTimeFreshMs = 120'000;
 // Guest: the host's night from its last progress packet (-1 = not known yet).
 std::atomic<s32> bbsc_host_time_bits{-1};
@@ -6369,7 +6373,7 @@ size_t RestoreBbscOwnWorld(std::string_view why) {
     size_t bits = 0;
     size_t missing = 0;
     for (const auto& [key, own] : bbsc_own_world) {
-        if (key == BbscOwnTimeKey || key == BbscOwnChaliceKey) {
+        if (key == BbscOwnTimeKey || key == BbscOwnChaliceKey || key == BbscOwnHomeKey) {
             continue; // our own night and Chalice bits: put back below, after every real group
         }
         const u64 storage = BbscFlagGroupStorage(key);
@@ -6419,6 +6423,10 @@ size_t RestoreBbscOwnWorld(std::string_view why) {
         }
     }
     RestoreBbscOwnChaliceBits(why);
+    if (const auto home = bbsc_own_world.find(BbscOwnHomeKey);
+        home != bbsc_own_world.end() && why == "after a crash") {
+        NoteBbscRecoveredHomeSpot(home->second.data()); // the trip home of a stub load needs it
+    }
     bbsc_own_world.clear();
     bbsc_own_world_dirty = false;
     if (bbsc_own_world_slot.has_value()) {
@@ -9789,6 +9797,39 @@ void KeepBbscHomeSpot() {
     BBSC_TIMELINE("HOME", "kept our spot in {} for the trip home", BbscAreaName(map));
 }
 
+// Into the own world journal (file included), after the join capture: after a crash the spot of
+// the trip home is still known.
+void KeepBbscHomeSpotInJournal() {
+    if (!bbsc_home_spot.valid) {
+        return;
+    }
+    std::array<u8, BbscWorldGroupBytes> packed{};
+    std::memcpy(packed.data(), &bbsc_home_spot.map, 4);
+    std::memcpy(packed.data() + 4, bbsc_home_spot.position.data(), 16);
+    std::memcpy(packed.data() + 20, bbsc_home_spot.rotation.data(), 16);
+    packed[36] = 1;
+    bbsc_own_world[BbscOwnHomeKey] = packed;
+    bbsc_own_world_dirty = true;
+    WriteBbscOwnWorldFile();
+}
+
+void NoteBbscRecoveredHomeSpot(const u8* bytes) {
+    if (bytes[36] != 1 || bbsc_home_spot.valid) {
+        return;
+    }
+    std::memcpy(&bbsc_home_spot.map, bytes, 4);
+    std::memcpy(bbsc_home_spot.position.data(), bytes + 4, 16);
+    std::memcpy(bbsc_home_spot.rotation.data(), bytes + 20, 16);
+    bbsc_home_spot.valid = true;
+    bbsc_home_spot.left = true; // we were away when the game closed
+    LOG_INFO(Debug, "BBSC return home: the spot {:#x} we joined from was kept by an earlier run",
+             bbsc_home_spot.map);
+}
+
+// A trip home that BBSC asks for in our own world (an empty Chalice load): the map choice would take
+// the forced warp off as "not a guest", so it leaves it alone until this time.
+s64 bbsc_forced_home_until_ms = 0;
+
 // Game tick: forget the spot once we are home again after having been away.
 void TickBbscHomeSpot() {
     if (!bbsc_home_spot.valid) {
@@ -9849,7 +9890,7 @@ void GuardBbscStrayForcedWarp(const GuestRegisterSnapshot& registers) {
     const u32 forced_map = ReadValue<u32>(global, 0x14F0);
     // Mod 24 only cleared it when +0x14F0 held no map; 22:17:12 it held the host's own map and the
     // host still fell (the position is the summon placement's, not his). Not a guest = no forced warp.
-    const bool clear = BbscOwnWorldNonGuest(global);
+    const bool clear = BbscOwnWorldNonGuest(global) && SteadyNowMs() >= bbsc_forced_home_until_ms;
     if (clear) {
         WriteValue<u8>(global, 0x1520, 0);
     } else if (ReadValue<u8>(global, 0x1592) == 0 && GetSessionState() != 4 &&
@@ -9874,7 +9915,7 @@ void TickBbscStrayForcedWarp() {
     last_ms = now;
     const u64 global = GetGlobalState();
     if (!BbscOwnWorldNonGuest(global) || ReadValue<u8>(global, 0x08) != 0 ||
-        ReadValue<u8>(global, 0x1520) == 0) {
+        ReadValue<u8>(global, 0x1520) == 0 || now < bbsc_forced_home_until_ms) {
         since_ms = 0;
         return;
     }
@@ -10207,6 +10248,24 @@ void TickBbscStuckLeaveLocks() {
 // 0x01385930): event state 2, forced warp global+0x1520 = 1, home respawn point 0x01332BC0(-1),
 // StageTransition 0x013CDE30.
 constexpr s64 BbscStrandedMs = 15'000;
+
+// The Lua and event state the trip home needs are there.
+bool BbscTripHomeReady(u64& lua, u64& event_state) {
+    const u64 lua_man = ReadValue<u64>(image_base + 0x0553B0C8, 0);
+    lua = ReadablePointer(lua_man, 0x10) ? ReadValue<u64>(lua_man, 8) : 0;
+    event_state = ReadValue<u64>(image_base + 0x0553B0D8, 0);
+    return lua != 0 && ReadablePointer(event_state, 4) && IsSprjLuaEventManReady();
+}
+
+void BbscTripHome(u64 global, u64 lua, u64 event_state, bool forced = true) {
+    WriteValue<s32>(event_state, 0, 2);
+    WriteValue<u8>(global, 0x1520, forced ? 1 : 0); // 0: the respawn select takes the last lamp
+    using HomePoint = void PS4_SYSV_ABI (*)(u64 lua, s32 point);
+    using Transition = u64 PS4_SYSV_ABI (*)();
+    reinterpret_cast<HomePoint>(image_base + 0x01332BC0)(lua, -1);
+    reinterpret_cast<Transition>(image_base + 0x013CDE30)();
+}
+
 void TickBbscStrandedGuest() {
     static s64 since_ms = 0;
     static s64 last_ms = 0;
@@ -10232,10 +10291,9 @@ void TickBbscStrandedGuest() {
         return;
     }
     since_ms = 0;
-    const u64 lua_man = ReadValue<u64>(image_base + 0x0553B0C8, 0);
-    const u64 lua = ReadablePointer(lua_man, 0x10) ? ReadValue<u64>(lua_man, 8) : 0;
-    const u64 event_state = ReadValue<u64>(image_base + 0x0553B0D8, 0);
-    if (lua == 0 || !ReadablePointer(event_state, 4) || !IsSprjLuaEventManReady()) {
+    u64 lua = 0;
+    u64 event_state = 0;
+    if (!BbscTripHomeReady(lua, event_state)) {
         return;
     }
     LOG_WARNING(Debug, "BBSC leave: still in another player's world {} s after the session ended - "
@@ -10248,12 +10306,74 @@ void TickBbscStrandedGuest() {
         // A dead guest keeps the locks that make the game's leave scripts return early.
         ReleaseBbscLeaveLocks("dead and stranded after the session ended");
     }
-    WriteValue<s32>(event_state, 0, 2);
-    WriteValue<u8>(global, 0x1520, 1);
-    using HomePoint = void PS4_SYSV_ABI (*)(u64 lua, s32 point);
-    using Transition = u64 PS4_SYSV_ABI (*)();
-    reinterpret_cast<HomePoint>(image_base + 0x01332BC0)(lua, -1);
-    reinterpret_cast<Transition>(image_base + 0x013CDE30)();
+    BbscTripHome(global, lua, event_state);
+}
+
+// Solo in our own world and loaded into an empty Chalice stub (layout id -1: grey screen, falling),
+// e.g. after a crash as a guest in the host's dungeon left the save there. The same trip home, to the
+// spot we joined from (kept in the journal), once the own record is back.
+void TickBbscChaliceStubHome() {
+    static s64 last_ms = 0;
+    static s64 handled_load_ms = 0;
+    static int sent = 0;
+    const s64 now = SteadyNowMs();
+    if (image_base == 0 || now - last_ms < 1'000) {
+        return;
+    }
+    last_ms = now;
+    const u64 global = GetGlobalState();
+    if (bbsc_chalice_layout_state.load() != 1 || !BbscOwnWorldNonGuest(global) ||
+        GetSessionState() != 0 || ReadValue<u8>(global, 0x08) != 0) {
+        return;
+    }
+    const u32 here = GetCurrentPackedMap();
+    if (here != 0 && BbscMapArea(here) != BbscChaliceArea) {
+        bbsc_chalice_layout_state.store(0); // another map since: the state is old
+        return;
+    }
+    const s64 load_ms = bbsc_chalice_load_ms.load();
+    const u64 me = GetLocalPlayerCharacter();
+    if (load_ms == handled_load_ms || now - load_ms < 5'000 || me == 0 ||
+        !bbsc_own_world.empty()) {
+        return; // done for this load, the load not settled, or our own record not back yet
+    }
+    const bool have_home = bbsc_home_spot.valid && bbsc_home_spot.left &&
+                           BbscMapArea(bbsc_home_spot.map) != BbscChaliceArea;
+    u64 lua = 0;
+    u64 event_state = 0;
+    if (!BbscTripHomeReady(lua, event_state)) {
+        return;
+    }
+    handled_load_ms = load_ms;
+    if (sent >= 2) {
+        LOG_WARNING(Debug, "BBSC chalice: the load built no dungeon again after {} trip(s) home; "
+                           "not sending home again",
+                    sent);
+        return;
+    }
+    ++sent;
+    const u32 target = have_home ? bbsc_home_spot.map : BbscDreamStateMap;
+    LOG_WARNING(Debug,
+                "BBSC chalice: our own load of map {:#x} built no dungeon (layout id -1) - sending "
+                "us {} {:#x} ({}){}",
+                here, have_home ? "home to" : "to the Hunter's Dream, no spot to go home to is known:",
+                target, BbscAreaName(target), GetCharacterHp(me) <= 0 ? ", dead" : "");
+    BBSC_TIMELINE("CHALICE", "own load built no dungeon - sending us to {}", BbscAreaName(target));
+    if (GetCharacterHp(me) <= 0) {
+        ReleaseBbscLeaveLocks("dead in an empty Chalice load");
+    }
+    bbsc_chalice_layout_state.store(0);
+    if (have_home) {
+        PutBbscHomeSpot(global);
+        bbsc_forced_home_until_ms = now + 30'000;
+        BbscTripHome(global, lua, event_state);
+        return;
+    }
+    // The Dream's lamp as the last lamp (point 2102961 = area 21 block 0, aux 101200, as the captures
+    // read it from global+0x1528): the respawn select takes it, and so does any later death or load,
+    // instead of the Chalice. HYPOTHESIS until a log shows the landing.
+    WriteValue<s64>(global, 0x1528, (s64{101'200} << 32) | 2'102'961);
+    BbscTripHome(global, lua, event_state, false);
 }
 
 // Shop trace (2026-10-07). Report: in the host's Dream the Bath Messenger sold the guest everything
@@ -17773,6 +17893,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         TickBbscLeaveLocks();
         TickBbscStuckLeaveLocks();
         TickBbscStrandedGuest();
+        TickBbscChaliceStubHome();
         TickBbscBossLine();
         TickBbscProgressBroadcast();
         TickBbscOwnWorld();
