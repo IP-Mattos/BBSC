@@ -10310,38 +10310,78 @@ void TickBbscStrandedGuest() {
 }
 
 // Solo in our own world and loaded into an empty Chalice stub (layout id -1: grey screen, falling),
-// e.g. after a crash as a guest in the host's dungeon left the save there. The same trip home, to the
-// spot we joined from (kept in the journal), once the own record is back.
+// e.g. after a crash as a guest in the host's dungeon left the save there. Away within seconds: the
+// journal is recovered at once when the save slot is known (it gives the spot we joined from and our
+// own record), else the trip goes to the Hunter's Dream first and the usual recovery follows. The
+// trip does not read the Chalice record, so the order does not matter for it.
 void TickBbscChaliceStubHome() {
     static s64 last_ms = 0;
     static s64 handled_load_ms = 0;
+    static s64 recover_tried_load_ms = 0;
+    static s64 logged_load_ms = 0;
+    static std::string logged_reasons;
     static int sent = 0;
     const s64 now = SteadyNowMs();
-    if (image_base == 0 || now - last_ms < 1'000) {
+    if (image_base == 0 || now - last_ms < 500) {
         return;
     }
     last_ms = now;
     const u64 global = GetGlobalState();
-    if (bbsc_chalice_layout_state.load() != 1 || !BbscOwnWorldNonGuest(global) ||
-        GetSessionState() != 0 || ReadValue<u8>(global, 0x08) != 0) {
-        return;
-    }
-    const u32 here = GetCurrentPackedMap();
-    if (here != 0 && BbscMapArea(here) != BbscChaliceArea) {
-        bbsc_chalice_layout_state.store(0); // another map since: the state is old
-        return;
-    }
     const s64 load_ms = bbsc_chalice_load_ms.load();
+    if (bbsc_chalice_layout_state.load() != 1 || load_ms == handled_load_ms) {
+        return;
+    }
+    // Once per reason and load: what the trip is waiting for.
+    const auto wait = [&](std::string_view reason) {
+        if (logged_load_ms != load_ms) {
+            logged_load_ms = load_ms;
+            logged_reasons.clear();
+            LOG_INFO(Debug, "BBSC chalice: the load of map 0x1d000000 built no dungeon (layout id "
+                            "-1) - own world, session state {}", GetSessionState());
+        }
+        if (logged_reasons.find(reason) == std::string::npos) {
+            logged_reasons += reason;
+            logged_reasons += ';';
+            LOG_INFO(Debug, "BBSC chalice: the trip home waits - {}", reason);
+        }
+    };
+    if (!BbscOwnWorldNonGuest(global) || GetSessionState() != 0) {
+        return; // a guest (its own reload) or not our own world
+    }
+    if (ReadValue<u8>(global, 0x08) != 0) {
+        // A load that began after the chalice one means the state is old (the stub is gone).
+        if (now - load_ms > 10'000) {
+            bbsc_chalice_layout_state.store(0);
+        }
+        wait("a load is running");
+        return;
+    }
     const u64 me = GetLocalPlayerCharacter();
-    if (load_ms == handled_load_ms || now - load_ms < 5'000 || me == 0 ||
-        !bbsc_own_world.empty()) {
-        return; // done for this load, the load not settled, or our own record not back yet
+    if (now - load_ms < 3'000) {
+        wait("the load is settling");
+        return;
+    }
+    if (me == 0) {
+        wait("no character yet");
+        return;
+    }
+    // Journal first when the save slot allows it (character checks stay in RecoverBbscOwnWorldFile).
+    if (bbsc_own_world.empty() && recover_tried_load_ms != load_ms) {
+        recover_tried_load_ms = load_ms;
+        if (const auto slot = BbscActiveSaveSlot(); slot.has_value()) {
+            if (!RecoverBbscOwnWorldFile(*slot)) {
+                wait("no journal to recover, or the save slot gate refused it");
+            }
+        } else {
+            wait("no save slot known yet, so no journal recovery before the trip");
+        }
     }
     const bool have_home = bbsc_home_spot.valid && bbsc_home_spot.left &&
                            BbscMapArea(bbsc_home_spot.map) != BbscChaliceArea;
     u64 lua = 0;
     u64 event_state = 0;
     if (!BbscTripHomeReady(lua, event_state)) {
+        wait("the Lua and event state are not ready");
         return;
     }
     handled_load_ms = load_ms;
@@ -10352,6 +10392,7 @@ void TickBbscChaliceStubHome() {
         return;
     }
     ++sent;
+    const u32 here = GetCurrentPackedMap();
     const u32 target = have_home ? bbsc_home_spot.map : BbscDreamStateMap;
     LOG_WARNING(Debug,
                 "BBSC chalice: our own load of map {:#x} built no dungeon (layout id -1) - sending "
