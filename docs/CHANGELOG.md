@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-11-04 - Notice when a host rang the sign but the join failed
+
+- A guest whose sign was rung (HTTP claim delivered) but never became a join now gets an on-screen
+  notice, at most once every 30 s: "A host rang your sign but the join failed. They can ring it again."
+  Before, the failed ring showed nothing.
+
 ## 2026-10-04 (c) - mod 11: Silencing Blank ends the co-op cleanly; Memory Altar for the guest
 
 - New tool: tools\gamedata\lua50.py - reads the game's compiled Lua (Lua 5.0 with one extra empty list

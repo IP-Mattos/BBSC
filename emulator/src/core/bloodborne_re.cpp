@@ -12964,8 +12964,30 @@ void ArmBbscRejoinLines(bool guest, u32 target_map, s64 for_ms) {
 
 // Points the role table at the "caught up" lines while a warp is on, and back afterwards.
 void TickBbscNoticeRestore(); // below
+
+// Set by other threads (BbscPostNotice). The banner is a game call, so the game thread shows it.
+// 0 = none; 1 = host rang our sign, join failed.
+std::atomic<int> bbsc_notice_request{0};
+s64 bbsc_notice_last_ms[2] = {0, 0};
+constexpr s64 BbscNoticeMinGapMs = 30'000; // retries come every ~55 s
+
+void TickBbscRequestedNotice() {
+    const int request = bbsc_notice_request.exchange(0);
+    if (request != 1) {
+        return;
+    }
+    const s64 now = SteadyNowMs();
+    if (bbsc_notice_last_ms[request] != 0 && now - bbsc_notice_last_ms[request] < BbscNoticeMinGapMs) {
+        return;
+    }
+    bbsc_notice_last_ms[request] = now;
+    BbscAnnounce(u"A host rang your sign but the join failed.\nThey can ring it again.",
+                 "join failed");
+}
+
 void TickBbscRejoinLines() {
     TickBbscNoticeRestore();
+    TickBbscRequestedNotice();
     if (!BbscMessagesEnabled() || !SaveBbscRoleLines()) {
         return;
     }
@@ -16994,6 +17016,12 @@ std::optional<std::uint32_t> GetBbscConnectFirstAreaId() {
 
 void BbscTimelineEvent(std::string_view kind, std::string_view text) {
     BbscTimeline(kind, text);
+}
+
+void BbscPostNotice(int which) {
+    if (which == 1) {
+        bbsc_notice_request.store(which);
+    }
 }
 
 // ---- Message and bloodstain lists (2026-10-18) ---------------------------------------------------
