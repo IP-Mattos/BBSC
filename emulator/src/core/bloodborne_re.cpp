@@ -5931,6 +5931,7 @@ const std::string& BbscProcessUserId() {
 }
 
 // The character being played: the save slot file the game wrote last, during this run.
+std::filesystem::file_time_type bbsc_active_save_time = bbsc_run_started; // of that save
 std::optional<BbscSaveSlot> BbscActiveSaveSlotUnchecked();
 // Runs inside game hooks (the join load): a filesystem error must never become an exception there.
 std::optional<BbscSaveSlot> BbscActiveSaveSlot() {
@@ -6014,6 +6015,7 @@ std::optional<BbscSaveSlot> BbscActiveSaveSlotUnchecked() {
         }
         ec.clear();
     }
+    bbsc_active_save_time = best_time;
     return best;
 }
 
@@ -6447,7 +6449,18 @@ void TickBbscHostTime() {
 }
 
 // A file an earlier run left (the game crashed or was closed while a guest): put back now.
+// Set by ParkBbscOwnWorld: until a save is written after the quit, "the newest save" may still be
+// the character that was left, not the one loaded since, so no file is recovered.
+std::optional<std::filesystem::file_time_type> bbsc_parked_save_time;
+
 bool RecoverBbscOwnWorldFile(const BbscSaveSlot& slot) {
+    if (bbsc_parked_save_time.has_value()) {
+        BbscActiveSaveSlot(); // refreshes bbsc_active_save_time
+        if (bbsc_active_save_time <= *bbsc_parked_save_time) {
+            return false;
+        }
+        bbsc_parked_save_time.reset();
+    }
     if (!bbsc_own_world.empty() || !BbscHomeForOwnWorld() || !LoadBbscOwnWorldFile(slot)) {
         return false;
     }
@@ -7054,6 +7067,32 @@ void OnBbscChaliceLoad(const GuestRegisterSnapshot& registers) {
         BBSC_TIMELINE("CHALICE", "{} load of map {:#x} - slot {}, 9020 {:#04x}, layout id {:#x}",
                       guest ? "guest" : "host", map, slot, bits, layout);
     }
+}
+
+// Quit to title: another character can be loaded next, so the journal goes to its file and leaves
+// memory; the file is found again by its character's slot (RecoverBbscOwnWorldFile). Without a file on
+// disk (no save slot known yet) it stays in memory, as nothing else can hold it.
+void ParkBbscOwnWorld(std::string_view why) {
+    if (bbsc_own_world.empty()) {
+        return;
+    }
+    WriteBbscOwnWorldFile();
+    if (bbsc_own_world_dirty || !bbsc_own_world_slot.has_value()) {
+        LOG_WARNING(Debug, "BBSC own world ({}): the kept copy is not on disk yet, it stays in memory", why);
+        return;
+    }
+    LOG_INFO(Debug, "BBSC own world ({}): {} kept group(s) left in user {} slot {}'s file, memory cleared",
+             why, bbsc_own_world.size(), bbsc_own_world_slot->user, bbsc_own_world_slot->slot);
+    BBSC_TIMELINE("WORLD", "own world ({}): kept groups left in the file, memory cleared", why);
+    BbscActiveSaveSlot(); // refreshes bbsc_active_save_time
+    bbsc_parked_save_time = bbsc_active_save_time;
+    bbsc_own_world.clear();
+    bbsc_own_world_dirty = false;
+    bbsc_own_world_slot.reset();
+    bbsc_own_world_file_merged = false;
+    bbsc_chalice_applied = {};
+    bbsc_dream_own.held = 0;
+    ClearBbscChaliceHostRecord();
 }
 
 // Chalice loader, 0x01FF8D20 entry (rsi = the layout record; a first u32 of -1 returns at once).
@@ -9607,6 +9646,7 @@ void PS4_SYSV_ABI BbscQuitToTitleHook(u64, const GuestRegisterSnapshot* register
              "map={:#x}",
              caller > image_base ? caller - image_base : caller, GetSessionState(),
              RemotePlayerCount(), GetCurrentPackedMap());
+    ParkBbscOwnWorld("quit to title");
     SuspendBbscPersistence("quit to title");
 }
 
