@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-11-04 - Join: one load, with a loading screen
+
+- The second reload after a cross-map join (SHADPS4_BBSC_WARP_JOIN) is off by default. Set the switch
+  to get it back.
+- The load cover treats the loading screen state at MenuMan+0x804 as 1 asked, 2 shown, 3 and 4
+  closing. From 2 on the screen is left to the game. In state 1 BBSC asks for it itself after 1.5 s,
+  and in state 0 right after a shown screen or after 1.5 s of cover, so a join with one load shows a
+  loading screen instead of plain black. The log shows each state change and when BBSC opens or closes
+  the screen.
+
 ## 2026-10-04 (c) - mod 11: Silencing Blank ends the co-op cleanly; Memory Altar for the guest
 
 - New tool: tools\gamedata\lua50.py - reads the game's compiled Lua (Lua 5.0 with one extra empty list
