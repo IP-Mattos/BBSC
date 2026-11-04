@@ -11737,17 +11737,32 @@ void NoteBbscGuestEnemyDeath(u64 dead) {
 // STRONGLY INDICATED. BBSC now rolls the lot itself, as the award does without Discovery: the game's
 // own ItemLotParam row (BbscGameParamTable), one entry picked by lotItemBasePoint01-08 (an entry with
 // no item is "nothing"), a one-time drop (get flag on) is not given twice. Goods (category 4) go
-// straight into the carried items - no popup. Blood gems (8), weapons (0), attire (1) and category 15
-// would need the award and its popup, so a guest does not get them for now (logged, timeline ITEMS).
+// straight into the carried items - no popup, what does not fit goes to the storage box. Blood gems
+// (8), weapons (0) and attire (1) need the award and its popup: they are queued in a file and
+// awarded at home (TickBbscOwedDrops). Category 15 and unknown ones are not given (logged).
 u64 BbscGameParamTable(std::string_view type);       // see "The BBSC hunter's kit"
 u64 BbscParamRow(u64 table, u32 id, size_t size);   // see "The BBSC hunter's kit"
 constexpr size_t ItemLotRowSize = 0x94;
 
-// Puts goods into the carried items as the kit and the boss goods do; the slot, or -1.
-s32 AddBbscCarriedGoods(u32 goods, s32 count) {
+u64 BbscStorageInventory();                      // see "Restock"
+s32 BbscInventoryCount(u64 inventory, u32 code); // see "Restock"
+
+// What GiveBbscGuestGoods placed; fits_* is what 0x014D9A80 answered for the first ask there.
+struct BbscGoodsPlaced {
+    s32 carried = 0;
+    s32 stored = 0;
+    s32 fits_carried = -1;
+    s32 fits_stored = -1;
+};
+
+// The game's own give (0x017D89F0) asks 0x014D9A80 / adds with 0x014DA0A0 on the carried items,
+// then on the storage box for the rest; so does this. A partial fit sends the remainder on; each add
+// is counted by the stack size before and after.
+BbscGoodsPlaced GiveBbscGuestGoods(u32 goods, s32 count) {
+    BbscGoodsPlaced placed;
     const u64 carried = BbscCarriedInventory();
     if (carried == 0 || count <= 0) {
-        return -1;
+        return placed;
     }
     using Fits = s32 PS4_SYSV_ABI (*)(u64 inventory, const u32* code, s32 count);
     using Add = s32 PS4_SYSV_ABI (*)(u64 inventory, const u32* key, s32 count);
@@ -11755,13 +11770,116 @@ s32 AddBbscCarriedGoods(u32 goods, s32 count) {
     alignas(16) static u32 key = 0;
     code = 0x40000000u | goods;
     key = 0x80000000u | (3u << 28) | goods;
-    const s32 fits = reinterpret_cast<Fits>(image_base + 0x014D9A80)(carried, &code, count);
-    if (fits <= 0) {
-        return -1;
+    s32 left = count;
+    for (const u64 destination : {carried, BbscStorageInventory()}) {
+        if (destination == 0 || left <= 0) {
+            continue;
+        }
+        const bool is_carried = destination == carried;
+        const s32 fits = reinterpret_cast<Fits>(image_base + 0x014D9A80)(destination, &code, left);
+        (is_carried ? placed.fits_carried : placed.fits_stored) = fits;
+        if (fits <= 0) {
+            continue;
+        }
+        const s32 before = BbscInventoryCount(destination, code);
+        reinterpret_cast<Add>(image_base + 0x014DA0A0)(destination, &key, std::min(fits, left));
+        const s32 added = std::clamp(BbscInventoryCount(destination, code) - before, 0, left);
+        (is_carried ? placed.carried : placed.stored) += added;
+        left -= added;
     }
-    const s32 slot =
-        reinterpret_cast<Add>(image_base + 0x014DA0A0)(carried, &key, std::min(fits, count));
-    return slot >= 0 && BbscInventoryHas(carried, code) ? slot : -1;
+    return placed;
+}
+
+// ---- Drops owed at home --------------------------------------------------------------------------
+// A weapon, blood gem or attire is added by the award 0x017DDC50 with its popup, which never closes
+// in a session. The rolled entry is kept in <mod>/guest-items/owed-drops-<user>-<slot>.txt (header,
+// then "lot entry category item flag" per line) and awarded at home. At home the award forces the
+// rolled entry by zeroing the other entries' weights in the lot's row for the call, so the game
+// builds the item itself (durability, gem properties). The line is removed before the award: a
+// crash then loses that item rather than giving it twice.
+struct BbscOwedDrop {
+    s32 lot = 0;
+    u32 entry = 0;
+    u32 category = 0;
+    s32 item = 0;
+    s32 flag = 0;
+};
+std::mutex bbsc_owed_drops_mutex;
+
+std::filesystem::path BbscOwedDropsPath(const BbscSaveSlot& slot) {
+    return Common::FS::GetUserPath(Common::FS::PathType::CapturesDir).parent_path() /
+           "guest-items" / fmt::format("owed-drops-{}-{}.txt", slot.user, slot.slot);
+}
+
+std::vector<BbscOwedDrop> ReadBbscOwedDrops(const std::filesystem::path& path) {
+    std::vector<BbscOwedDrop> drops;
+    try {
+        std::ifstream file(path);
+        std::string line;
+        if (!file || !std::getline(file, line) || line.rfind("BBSC-OWED-DROPS 1", 0) != 0) {
+            return drops;
+        }
+        while (std::getline(file, line)) {
+            std::istringstream fields(line);
+            BbscOwedDrop drop;
+            if (fields >> drop.lot >> drop.entry >> drop.category >> drop.item >> drop.flag &&
+                drop.lot > 0 && drop.entry < 8 && drop.item > 0) {
+                drops.push_back(drop);
+            }
+        }
+    } catch (const std::exception& e) {
+        LOG_WARNING(Debug, "BBSC guest drop: could not read the owed drops ({})", e.what());
+    }
+    return drops;
+}
+
+// False when the list could not be written (nothing is then considered changed).
+bool WriteBbscOwedDrops(const std::filesystem::path& path, const std::vector<BbscOwedDrop>& drops) {
+    try {
+        std::error_code ec;
+        if (drops.empty()) {
+            std::filesystem::remove(path, ec);
+            return !std::filesystem::exists(path, ec);
+        }
+        std::filesystem::create_directories(path.parent_path(), ec);
+        const auto temp = std::filesystem::path(path).concat(".tmp");
+        {
+            std::ofstream file(temp, std::ios::binary | std::ios::trunc);
+            file << "BBSC-OWED-DROPS 1\n";
+            for (const BbscOwedDrop& d : drops) {
+                file << d.lot << ' ' << d.entry << ' ' << d.category << ' ' << d.item << ' '
+                     << d.flag << '\n';
+            }
+            if (!file) {
+                return false;
+            }
+        }
+        std::filesystem::rename(temp, path, ec);
+        return !ec;
+    } catch (const std::exception& e) {
+        LOG_WARNING(Debug, "BBSC guest drop: could not write the owed drops ({})", e.what());
+        return false;
+    }
+}
+
+// Empty when queued, else why not.
+std::string_view QueueBbscOwedDrop(const BbscOwedDrop& drop) {
+    const auto slot = BbscActiveSaveSlot();
+    if (!slot.has_value()) {
+        return "the character is not known yet";
+    }
+    std::scoped_lock lock{bbsc_owed_drops_mutex};
+    const auto path = BbscOwedDropsPath(*slot);
+    auto drops = ReadBbscOwedDrops(path);
+    if (drops.size() >= 100) {
+        return "the list owed at home is full";
+    }
+    if (drop.flag > 0 &&
+        std::ranges::any_of(drops, [&drop](const auto& d) { return d.flag == drop.flag; })) {
+        return "that one-time drop is already owed";
+    }
+    drops.push_back(drop);
+    return WriteBbscOwedDrops(path, drops) ? std::string_view{} : "the list could not be saved";
 }
 
 void GiveBbscGuestDrop(s32 lot, u32 name) {
@@ -11807,36 +11925,67 @@ void GiveBbscGuestDrop(s32 lot, u32 name) {
                  lot, pick + 1, flag);
         return;
     }
-    if (category != 4) {
-        static const std::array<std::string_view, 5> kinds{"weapon", "attire", "", "", "goods"};
-        const std::string_view kind = category == 8    ? "blood gem"
-                                      : category == 15 ? "category 15 item"
-                                      : category < kinds.size() && !kinds[category].empty()
-                                          ? kinds[category]
-                                          : "item";
-        LOG_INFO(Debug, "BBSC guest drop: enemy (name id {}) dropped a {} (id {}, lot {}) - not given "
-                        "to a guest (the game's item popup would stay on screen)",
-                 name, kind, item, lot);
-        BBSC_TIMELINE("ITEMS", "guest drop: a {} (id {}, lot {}) not given - the game's item popup "
-                               "would stay on screen",
-                      kind, item, lot);
+    static const std::array<std::string_view, 5> kinds{"weapon", "attire", "", "", "goods"};
+    const std::string_view kind = category == 8    ? "blood gem"
+                                  : category == 15 ? "category 15 item"
+                                  : category < kinds.size() && !kinds[category].empty()
+                                      ? kinds[category]
+                                      : "item";
+    if (category == 0 || category == 1 || category == 8) {
+        const std::string_view why = QueueBbscOwedDrop(
+            {lot, static_cast<u32>(pick), category, item, flag > 0 ? flag : 0});
+        LOG_INFO(Debug, "BBSC guest drop: enemy (name id {}) dropped a {} (id {}, lot {}) - {}", name,
+                 kind, item, lot,
+                 why.empty() ? std::string{"owed, awarded at home"}
+                             : fmt::format("not kept: {}", why));
+        BBSC_TIMELINE("ITEMS", "guest drop: a {} (id {}, lot {}) {}", kind, item, lot,
+                      why.empty() ? "owed, awarded at home" : "not kept");
+        static s64 owed_notice_ms = 0;
+        if (why.empty() && SteadyNowMs() - owed_notice_ms > 15'000) {
+            owed_notice_ms = SteadyNowMs();
+            BbscAnnounce(u"A drop will reach you when you are back home.", "enemy drop owed");
+        }
         return;
     }
-    const s32 slot = AddBbscCarriedGoods(static_cast<u32>(item), count);
-    if (slot >= 0 && flag > 0) {
+    if (category != 4) {
+        LOG_INFO(Debug, "BBSC guest drop: enemy (name id {}) dropped a {} (id {}, lot {}) - not given "
+                        "to a guest (category {} is not delivered)",
+                 name, kind, item, lot, category);
+        BBSC_TIMELINE("ITEMS", "guest drop: a {} (id {}, lot {}) not given (category {})", kind, item,
+                      lot, category);
+        return;
+    }
+    const BbscGoodsPlaced placed = GiveBbscGuestGoods(static_cast<u32>(item), count);
+    const s32 given = placed.carried + placed.stored;
+    if (given > 0 && flag > 0) {
         using SetEventFlag = u64 PS4_SYSV_ABI (*)(u64 unused, u32 flag, u8 value);
         reinterpret_cast<SetEventFlag>(image_base + 0x0132E5A0)(0, static_cast<u32>(flag), 1);
     }
-    LOG_INFO(Debug, "BBSC guest drop: enemy (name id {}) died - goods {} x{} from lot {} {}", name,
-             item, count, lot,
-             slot >= 0 ? fmt::format("put into the carried items (slot {})", slot)
-                       : std::string{"did not fit (carried items full)"});
-    BBSC_TIMELINE("ITEMS", "guest drop: goods {} x{} from lot {} {}", item, count, lot,
-                  slot >= 0 ? "added" : "did not fit");
+    std::string outcome;
+    if (given == 0) {
+        outcome = fmt::format("no room (carried items fit {}, storage box fits {})",
+                              placed.fits_carried, placed.fits_stored);
+    } else {
+        if (placed.carried > 0) {
+            outcome = fmt::format("{} put into the carried items", placed.carried);
+        }
+        if (placed.stored > 0) {
+            outcome += fmt::format("{}{} put into the storage box", outcome.empty() ? "" : ", ",
+                                   placed.stored);
+        }
+        if (given < count) {
+            outcome += fmt::format(", {} lost: no room in either", count - given);
+        }
+    }
+    LOG_INFO(Debug, "BBSC guest drop: enemy (name id {}) died - goods {} x{} from lot {}: {}", name,
+             item, count, lot, outcome);
+    BBSC_TIMELINE("ITEMS", "guest drop: goods {} x{} from lot {}: {}", item, count, lot, outcome);
     static s64 notice_ms = 0;
-    if (slot >= 0 && SteadyNowMs() - notice_ms > 15'000) {
+    if (given > 0 && SteadyNowMs() - notice_ms > 15'000) {
         notice_ms = SteadyNowMs();
-        BbscAnnounce(u"An item was added to your items.", "enemy drop");
+        BbscAnnounce(placed.stored > 0 ? u"An item was added to your items or storage box."
+                                       : u"An item was added to your items.",
+                     "enemy drop");
     }
 }
 
@@ -11857,6 +12006,101 @@ void TickBbscGuestDrops() {
     for (const auto& [lot, name] : due) {
         GiveBbscGuestDrop(lot, name);
     }
+}
+
+// Game tick, at home and settled: award the drops owed from sessions, one every 3 s.
+void TickBbscOwedDrops() {
+    static const bool enabled = EnvFlagEnabled("SHADPS4_BBSC_GUEST_ITEMS");
+    static s64 home_since_ms = 0;
+    static s64 last_ms = 0;
+    static bool loaded = false;
+    static std::vector<BbscOwedDrop> pending;
+    if (!enabled || image_base == 0) {
+        return;
+    }
+    const u64 global = GetGlobalState();
+    if (GetSessionState() != 0 || !ReadablePointer(global, 0x1593) ||
+        ReadValue<u8>(global, 0x08) != 0 || ReadValue<u8>(global, 0x1592) == 0 ||
+        GetCharacterHp(GetLocalPlayerCharacter()) <= 0) {
+        home_since_ms = 0;
+        loaded = false;
+        pending.clear();
+        return;
+    }
+    const s64 now = SteadyNowMs();
+    if (home_since_ms == 0) {
+        home_since_ms = now;
+    }
+    if (now - home_since_ms < 5'000 || now - last_ms < 3'000) {
+        return;
+    }
+    const auto slot = BbscActiveSaveSlot();
+    if (!slot.has_value()) {
+        return;
+    }
+    const auto path = BbscOwedDropsPath(*slot);
+    if (!loaded) {
+        std::scoped_lock lock{bbsc_owed_drops_mutex};
+        pending = ReadBbscOwedDrops(path);
+        loaded = true;
+    }
+    if (pending.empty()) {
+        return;
+    }
+    const u64 item_man = ReadValue<u64>(image_base + ItemManPointerOffset, 0);
+    const u64 table = BbscGameParamTable("ITEMLOT_PARAM_ST");
+    if (!ReadablePointer(item_man, 0x10) || table == 0) {
+        return;
+    }
+    last_ms = now;
+    const BbscOwedDrop drop = pending.front();
+    pending.erase(pending.begin());
+    {
+        std::scoped_lock lock{bbsc_owed_drops_mutex};
+        auto list = ReadBbscOwedDrops(path);
+        const auto same = std::ranges::find_if(list, [&drop](const BbscOwedDrop& d) {
+            return d.lot == drop.lot && d.entry == drop.entry && d.item == drop.item &&
+                   d.flag == drop.flag;
+        });
+        if (same != list.end()) {
+            list.erase(same);
+        }
+        if (!WriteBbscOwedDrops(path, list)) {
+            pending.insert(pending.begin(), drop); // not removed on disk: do not award it yet
+            return;
+        }
+    }
+    const u64 row = BbscParamRow(table, static_cast<u32>(drop.lot), ItemLotRowSize);
+    if (row == 0 || ReadValue<s32>(row, drop.entry * 4) != drop.item ||
+        ReadValue<u32>(row, 0x20 + drop.entry * 4) != drop.category ||
+        ReadValue<u16>(row, 0x40 + drop.entry * 2) == 0) {
+        LOG_WARNING(Debug, "BBSC guest drop: owed item {} from lot {} no longer matches the game's "
+                           "table - dropped",
+                    drop.item, drop.lot);
+        return;
+    }
+    if (drop.flag > 0 && BbscEventFlag(static_cast<u32>(drop.flag))) {
+        LOG_INFO(Debug, "BBSC guest drop: owed item {} from lot {} was taken meanwhile (flag {})",
+                 drop.item, drop.lot, drop.flag);
+        return;
+    }
+    std::array<u16, 8> weights{};
+    for (u32 i = 0; i < 8; ++i) {
+        weights[i] = ReadValue<u16>(row, 0x40 + i * 2);
+        if (i != drop.entry) {
+            WriteValue<u16>(row, 0x40 + i * 2, 0);
+        }
+    }
+    using AwardItemLot = void PS4_SYSV_ABI (*)(u64 item_man, s32 lot, u32 forced);
+    reinterpret_cast<AwardItemLot>(image_base + AwardItemLotOffset)(item_man, drop.lot, 0);
+    for (u32 i = 0; i < 8; ++i) {
+        WriteValue<u16>(row, 0x40 + i * 2, weights[i]);
+    }
+    LOG_INFO(Debug, "BBSC guest drop: owed item {} (category {}) from lot {} awarded at home, {} "
+                    "more owed",
+             drop.item, drop.category, drop.lot, pending.size());
+    BBSC_TIMELINE("ITEMS", "guest drop: owed item {} (category {}) from lot {} awarded at home",
+                  drop.item, drop.category, drop.lot);
 }
 
 // ---- Shared progress, merge mode (2026-10-07) ----------------------------------------------------
@@ -17321,6 +17565,7 @@ void PS4_SYSV_ABI TraceEntry(u64 tag, const GuestRegisterSnapshot* registers) {
         TickBbscRelayHostLock();
         TickBbscBossRewards();
         TickBbscGuestDrops();
+        TickBbscOwedDrops();
         TickBbscSendBacklog();
         TickBbscLeaveLocks();
         TickBbscStuckLeaveLocks();
