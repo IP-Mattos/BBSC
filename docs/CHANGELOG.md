@@ -9,6 +9,9 @@ Tested in game with two players:
 - Guest can use the altar and workbench in the host's Dream.
 
 Not tested in game:
+- A guest no longer follows a host into a Chalice Dungeon: area 29 has one map id for every dungeon and the follow packet
+  has no dungeon id, so the guest loaded a stub. Chalice co-op is not supported yet.
+- A guest who died and was left in the host's world after the session ended is sent home too (gray screen).
 - Boss rewards awarded by a follow-up event reach the guest: Logarius (12501800, Crown of Illusions, lot 2502000) and
   m35 (13501800, Celestial Dial, lot 3501800). The other template events are already in the table.
 - Key items taken as a guest are put back at home. Goods from the give 0x017D89F0 window 0x016D8850 are listed in
